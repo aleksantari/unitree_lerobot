@@ -70,12 +70,33 @@ class JsonDataset:
         self.episode_paths = []
         self.task_paths = []
 
-        for task_path in glob.glob(os.path.join(self.data_dirs, "*")):
-            if os.path.isdir(task_path):
-                episode_paths = glob.glob(os.path.join(task_path, "*"))
-                if episode_paths:
+        def is_episode_dir(p: str) -> bool:
+            return os.path.isdir(p) and os.path.isfile(os.path.join(p, self.json_file))
+
+        # Support both layouts:
+        # - raw_dir/<episode>/data.json
+        # - raw_dir/<task>/<episode>/data.json
+        top_level = sorted(glob.glob(os.path.join(self.data_dirs, "*")))
+
+        # Case A: episodes directly under raw_dir.
+        direct_episode_dirs = [p for p in top_level if is_episode_dir(p)]
+        if direct_episode_dirs:
+            self.episode_paths.extend(direct_episode_dirs)
+            # Keep a single "task" entry for consistency (not used elsewhere).
+            self.task_paths.append(str(self.data_dirs))
+        else:
+            # Case B: tasks under raw_dir.
+            for task_path in top_level:
+                if not os.path.isdir(task_path):
+                    continue
+
+                candidate_episode_paths = sorted(
+                    glob.glob(os.path.join(task_path, "*"))
+                )
+                episode_dirs = [p for p in candidate_episode_paths if is_episode_dir(p)]
+                if episode_dirs:
                     self.task_paths.append(task_path)
-                    self.episode_paths.extend(episode_paths)
+                    self.episode_paths.extend(episode_dirs)
 
         self.episode_paths = sorted(self.episode_paths)
         self.episode_ids = list(range(len(self.episode_paths)))

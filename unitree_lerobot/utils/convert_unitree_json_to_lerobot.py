@@ -131,12 +131,12 @@ class JsonDataset:
             Concatenated numpy array of the requested data
         """
         result = []
-        for sample_data in episode_data["data"]:
-            data_array = np.array([], dtype=np.float32)
-            for part in parts:
+        for sample_data in episode_data["data"]:          #interate over every frame in episode
+            data_array = np.array([], dtype=np.float32)   # per frame accumulator
+            for part in parts:     # left_arm, right_arm..
                 key_parts = part.split(".")
                 qpos = None
-                for key_part in key_parts:
+                for key_part in key_parts:  
                     if qpos is None and key_part in sample_data[key] and sample_data[key][key_part] is not None:
                         qpos = sample_data[key][key_part]
                     else:

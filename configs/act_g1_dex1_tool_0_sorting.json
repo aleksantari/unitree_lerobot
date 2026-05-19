@@ -2,7 +2,7 @@
     "dataset": {
         "repo_id": "aleksantari/g1_dex1_tool_0_sorting",
         "root": null,
-        "episodes": null,
+        "episodes": [1, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 24, 25, 26, 27, 28, 29, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92, 93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112],
         "revision": null,
         "use_imagenet_stats": true,
         "streaming": false
@@ -40,7 +40,7 @@
             }
         },
         "device": "cuda",
-        "use_amp": false,
+        "use_amp": true,
         "push_to_hub": false,
         "repo_id": null,
         "private": null,
@@ -79,12 +79,12 @@
     "resume": false,
     "seed": 1000,
     "num_workers": 16,
-    "batch_size": 32,
+    "batch_size": 24,
     "steps": 100000,
     "eval_freq": 0,
     "log_freq": 100,
     "save_checkpoint": true,
-    "save_freq": 10000,
+    "save_freq": 5000,
     "use_policy_training_preset": true,
     "wandb": {
         "enable": true,

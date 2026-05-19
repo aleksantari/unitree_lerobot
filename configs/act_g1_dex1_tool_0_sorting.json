@@ -1,0 +1,103 @@
+{
+    "dataset": {
+        "repo_id": "aleksantari/g1_dex1_tool_0_sorting",
+        "root": null,
+        "episodes": null,
+        "revision": null,
+        "use_imagenet_stats": true,
+        "streaming": false
+    },
+    "env": null,
+    "policy": {
+        "type": "act",
+        "n_obs_steps": 1,
+        "input_features": {
+            "observation.state": {
+                "type": "STATE",
+                "shape": [16]
+            },
+            "observation.images.cam_left_high": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_right_high": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_left_wrist": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_right_wrist": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [16]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "push_to_hub": false,
+        "repo_id": null,
+        "private": null,
+        "tags": null,
+        "license": null,
+        "pretrained_path": null,
+        "chunk_size": 100,
+        "n_action_steps": 100,
+        "normalization_mapping": {
+            "VISUAL": "MEAN_STD",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "vision_backbone": "resnet18",
+        "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+        "replace_final_stride_with_dilation": false,
+        "pre_norm": false,
+        "dim_model": 512,
+        "n_heads": 8,
+        "dim_feedforward": 3200,
+        "feedforward_activation": "relu",
+        "n_encoder_layers": 4,
+        "n_decoder_layers": 1,
+        "use_vae": true,
+        "latent_dim": 32,
+        "n_vae_encoder_layers": 4,
+        "temporal_ensemble_coeff": null,
+        "dropout": 0.1,
+        "kl_weight": 10.0,
+        "optimizer_lr": 1e-05,
+        "optimizer_weight_decay": 1e-04,
+        "optimizer_lr_backbone": 1e-05
+    },
+    "output_dir": null,
+    "job_name": "act_g1_dex1_tool_0_sorting",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 16,
+    "batch_size": 32,
+    "steps": 100000,
+    "eval_freq": 0,
+    "log_freq": 100,
+    "save_checkpoint": true,
+    "save_freq": 10000,
+    "use_policy_training_preset": true,
+    "wandb": {
+        "enable": true,
+        "disable_artifact": false,
+        "project": "unitree_lerobot",
+        "entity": null,
+        "notes": null,
+        "run_id": null,
+        "mode": "online"
+    },
+    "eval": {
+        "n_episodes": 50,
+        "batch_size": 50,
+        "use_async_envs": false
+    }
+}

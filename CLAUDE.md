@@ -14,17 +14,35 @@ This repo is a thin wrapper around HuggingFace LeRobot, specialized for Unitree 
 
 ## Environment
 
-The conda env for this project is **`unitree_lerobot`** (Python 3.10). Always activate it via the lane-based wrapper:
+The conda env for this project is **`unitree-lerobot`** (env name uses `-`, package name uses `_`). Always activate it via the lane-based wrapper:
 
 ```bash
-bash -ic 'use_conda unitree_lerobot && <command>'
+bash -ic 'use_conda unitree-lerobot && <command>'
 ```
+
+**Intentional deviations from upstream:**
+
+- **Python 3.12** (upstream `unitree_lerobot` README pins 3.10). Bumped to match the rest of the local toolchain.
+- **PyTorch 2.7.1+cu128** (CUDA 12.8 wheel). Required because the host has an RTX 5090 (sm_120) — older torch wheels don't ship sm_120 kernels and silently fall back to CPU or fail to compile.
+
+These do not match the upstream pinned versions on purpose. Do not "fix" them back to the upstream defaults — torch will break on this GPU.
 
 ROS 2 and conda are kept apart with `use_conda` / `use_ros2` / `reset_lane` (see global CLAUDE.md). Never call `conda activate` directly.
 
 System dep that bites: ffmpeg must come from conda-forge (`conda install ffmpeg=7.1.1 -c conda-forge`) — torchcodec needs `libsvtav1` and the system ffmpeg won't have it.
 
 The submodule's lerobot must be installed first (`pip install -e unitree_lerobot/lerobot`) before `pip install -e .` at the repo root.
+
+**Script invocation: prefer `python -m`.** When suggesting commands that run files under `unitree_lerobot/`, use the module form, not the path form. The package is not always editable-installed in this env, so path-style invocation hits `ModuleNotFoundError: No module named 'unitree_lerobot'`. The `-m` form prepends CWD to `sys.path` and resolves the package correctly as long as the command is run from the repo root.
+
+```bash
+# DO — module form, works regardless of install state
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.utils.convert_unitree_json_to_lerobot \
+    --raw-dir ... --repo-id ... --robot_type ...'
+
+# DON'T — path form, breaks if `pip install -e .` was skipped
+python unitree_lerobot/utils/convert_unitree_json_to_lerobot.py ...
+```
 
 ## Layout
 

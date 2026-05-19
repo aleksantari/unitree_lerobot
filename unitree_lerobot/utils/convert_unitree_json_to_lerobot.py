@@ -180,6 +180,9 @@ class JsonDataset:
                     raise RuntimeError(f"Failed to read image: {image_path}")
 
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+                # Downsample to the schema target (480, 640). INTER_AREA is the right
+                # choice for shrinks; head cams at 1280x720 get squished 16:9 -> 4:3.
+                image_rgb = cv2.resize(image_rgb, (640, 480), interpolation=cv2.INTER_AREA)
                 images[image_key].append(image_rgb)
 
         return images

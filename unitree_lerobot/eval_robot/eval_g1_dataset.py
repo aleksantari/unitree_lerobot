@@ -23,7 +23,6 @@ from lerobot.utils.utils import (
 from lerobot.configs import parser
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.policies.pretrained import PreTrainedPolicy
-from multiprocessing.sharedctypes import SynchronizedArray
 from lerobot.processor.rename_processor import rename_stats
 from lerobot.processor import (
     PolicyAction,
@@ -33,8 +32,6 @@ from lerobot.processor import (
 from unitree_lerobot.eval_robot.utils.utils import (
     extract_observation,
     predict_action,
-    to_list,
-    to_scalar,
     EvalRealConfig,
 )
 from unitree_lerobot.eval_robot.utils.rerun_visualizer import RerunLogger, visualization_data
@@ -74,26 +71,9 @@ def eval_policy(
     ground_truth_actions = []
     predicted_actions = []
 
-    if cfg.send_real_robot:
-        from unitree_lerobot.eval_robot.make_robot import setup_robot_interface
-
-        robot_interface = setup_robot_interface(cfg)
-        arm_ctrl, arm_ik, ee_shared_mem, arm_dof, ee_dof = (
-            robot_interface[key] for key in ["arm_ctrl", "arm_ik", "ee_shared_mem", "arm_dof", "ee_dof"]
-        )
-        init_arm_pose = step["observation.state"][:arm_dof].cpu().numpy()
-
     # ===============init robot=====================
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
     if user_input.lower() == "s":
-        if cfg.send_real_robot:
-            # Initialize robot to starting pose
-            logger_mp.info("Initializing robot to starting pose...")
-            tau = robot_interface["arm_ik"].solve_tau(init_arm_pose)
-            robot_interface["arm_ctrl"].ctrl_dual_arm(init_arm_pose, tau)
-
-            time.sleep(1)
-
         for step_idx in tqdm.tqdm(range(from_idx, to_idx)):
             loop_start_time = time.perf_counter()
 
@@ -115,26 +95,6 @@ def eval_policy(
 
             ground_truth_actions.append(step["action"].numpy())
             predicted_actions.append(action_np)
-
-            if cfg.send_real_robot:
-                # Execute Action
-                arm_action = action_np[:arm_dof]
-                tau = arm_ik.solve_tau(arm_action)
-                arm_ctrl.ctrl_dual_arm(arm_action, tau)
-                # logger_mp.info(f"Arm Action: {arm_action}")
-
-                if cfg.ee:
-                    ee_action_start_idx = arm_dof
-                    left_ee_action = action_np[ee_action_start_idx : ee_action_start_idx + ee_dof]
-                    right_ee_action = action_np[ee_action_start_idx + ee_dof : ee_action_start_idx + 2 * ee_dof]
-                    # logger_mp.info(f"EE Action: left {left_ee_action}, right {right_ee_action}")
-
-                    if isinstance(ee_shared_mem["left"], SynchronizedArray):
-                        ee_shared_mem["left"][:] = to_list(left_ee_action)
-                        ee_shared_mem["right"][:] = to_list(right_ee_action)
-                    elif hasattr(ee_shared_mem["left"], "value") and hasattr(ee_shared_mem["right"], "value"):
-                        ee_shared_mem["left"].value = to_scalar(left_ee_action)
-                        ee_shared_mem["right"].value = to_scalar(right_ee_action)
 
             if cfg.visualization:
                 visualization_data(step_idx, observation, observation["observation.state"], action_np, rerun_logger)

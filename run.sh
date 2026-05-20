@@ -53,21 +53,31 @@ bash -ic 'use_conda unitree-lerobot && python -m lerobot.scripts.lerobot_train \
     --resume=true'
 
 # === Aggregate sorting + handover into a multi-task LeRobot dataset ===
-# Source datasets are read-only -- this creates a NEW dataset at aggr-repo-id.
+# Uses the official `lerobot-edit-dataset` CLI (operation.type=merge), which
+# wraps the same aggregate_datasets() function we patched locally to apply
+# upstream PR #2550 (https://github.com/huggingface/lerobot/pull/2550).
+# Source datasets are read-only -- this creates a NEW dataset at --repo_id.
 # meta/tasks.parquet ends up with 2 rows (one task string per source).
-# tyro takes list[str] as space-separated args, NOT a JSON literal.
-bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.utils.aggregate_datasets \
-    --repo-ids aleksantari/g1_dex1_tool_0_sorting aleksantari/g1_dex1_tool_0_handover \
-    --aggr-repo-id aleksantari/g1_dex1_tools_combined \
-    --push-to-hub'
+# The CLI does NOT auto-wipe the destination cache, so we rm -rf first to
+# keep re-runs idempotent.
 
-# Dry run (no hub push) -- recommended first to verify the result before re-running with --push-to-hub.
-bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.utils.aggregate_datasets \
-    --repo-ids aleksantari/g1_dex1_tool_0_sorting aleksantari/g1_dex1_tool_0_handover \
-    --aggr-repo-id aleksantari/g1_dex1_tools_combined'
+# Dry run (no hub push) -- recommended first to verify the result.
+rm -rf ~/.cache/huggingface/lerobot/aleksantari/g1_dex1_tools_combined
+bash -ic 'use_conda unitree-lerobot && lerobot-edit-dataset \
+    --repo_id aleksantari/g1_dex1_tools_combined \
+    --operation.type merge \
+    --operation.repo_ids "['"'"'aleksantari/g1_dex1_tool_0_sorting'"'"','"'"'aleksantari/g1_dex1_tool_0_handover'"'"']"'
 
 # Verify the aggregated dataset matches expectations.
 bash -ic 'use_conda unitree-lerobot && python test/test_aggregate_datasets.py'
+
+# Publish to hub once smoke test on the combined dataset passes locally.
+rm -rf ~/.cache/huggingface/lerobot/aleksantari/g1_dex1_tools_combined
+bash -ic 'use_conda unitree-lerobot && lerobot-edit-dataset \
+    --repo_id aleksantari/g1_dex1_tools_combined \
+    --operation.type merge \
+    --operation.repo_ids "['"'"'aleksantari/g1_dex1_tool_0_sorting'"'"','"'"'aleksantari/g1_dex1_tool_0_handover'"'"']" \
+    --push_to_hub true'
 
 # === Train GR00T-N1.5 on the single-task sorting dataset ===
 # Uses the lerobot-gr00t env (NOT unitree-lerobot) for flash-attn/transformers/peft/decord.

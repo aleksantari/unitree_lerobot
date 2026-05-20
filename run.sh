@@ -52,11 +52,34 @@ bash -ic 'use_conda unitree-lerobot && python -m lerobot.scripts.lerobot_train \
     --config_path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/last/pretrained_model/train_config.json \
     --resume=true'
 
-# === Train GR00T-N1.5 (uses the lerobot-gr00t env, NOT unitree-lerobot) ===
-# Config will set chunk_size=16, n_action_steps=16, embodiment_tag="unitree_g1",
+# === Aggregate sorting + handover into a multi-task LeRobot dataset ===
+# Source datasets are read-only -- this creates a NEW dataset at aggr-repo-id.
+# meta/tasks.parquet ends up with 2 rows (one task string per source).
+# tyro takes list[str] as space-separated args, NOT a JSON literal.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.utils.aggregate_datasets \
+    --repo-ids aleksantari/g1_dex1_tool_0_sorting aleksantari/g1_dex1_tool_0_handover \
+    --aggr-repo-id aleksantari/g1_dex1_tools_combined \
+    --push-to-hub'
+
+# Dry run (no hub push) -- recommended first to verify the result before re-running with --push-to-hub.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.utils.aggregate_datasets \
+    --repo-ids aleksantari/g1_dex1_tool_0_sorting aleksantari/g1_dex1_tool_0_handover \
+    --aggr-repo-id aleksantari/g1_dex1_tools_combined'
+
+# Verify the aggregated dataset matches expectations.
+bash -ic 'use_conda unitree-lerobot && python test/test_aggregate_datasets.py'
+
+# === Train GR00T-N1.5 on the single-task sorting dataset ===
+# Uses the lerobot-gr00t env (NOT unitree-lerobot) for flash-attn/transformers/peft/decord.
+# Config sets chunk_size=16, n_action_steps=16, embodiment_tag="unitree_g1",
 # tune_diffusion_model=false (tier-1 projector-only starting point).
 bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
     --config_path=configs/groot_g1_dex1_tool_0_sorting.json'
+
+# === Train GR00T-N1.5 on the combined sorting+handover dataset ===
+# Multi-task variant -- each batch carries one of two task strings, language conditioning live.
+bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
+    --config_path=configs/groot_g1_dex1_tools_combined.json'
 
 # === Attach to running tmux sessions ===
 tmux attach -t train_act          # ACT training

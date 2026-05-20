@@ -22,8 +22,8 @@ import glob
 import dataclasses
 import shutil
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from collections import defaultdict
 from typing import Literal
 
 from lerobot.utils.constants import HF_LEROBOT_HOME
@@ -153,37 +153,49 @@ class JsonDataset:
             result.append(data_array)
         return np.array(result)
 
-    def _parse_images(self, episode_path: str, episode_data) -> dict[str, list[np.ndarray]]:
-        """Load and stack images for a given camera key."""
+    @staticmethod
+    def _load_and_process_image(image_path: str) -> np.ndarray:
+        # Downsample to the schema target (480, 640). INTER_AREA is the right choice
+        # for shrinks; head cams at 1280x720 get squished 16:9 -> 4:3.
+        image = cv2.imread(image_path)
+        if image is None:
+            raise RuntimeError(f"Failed to read image: {image_path}")
+        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        return cv2.resize(image_rgb, (640, 480), interpolation=cv2.INTER_AREA)
 
-        images = defaultdict(list)
+    def _parse_images(self, episode_path: str, episode_data) -> dict[str, list[np.ndarray]]:
+        """Load and stack images for each camera, decoding in parallel across files."""
 
         keys = episode_data["data"][0]["colors"].keys()
         cameras = [key for key in keys if "depth" not in key]
 
+        # Build (image_key, slot_index, image_path) plan, preserving order.
+        plan: list[tuple[str, int, str]] = []
+        counts: dict[str, int] = {}
         for camera in cameras:
             image_key = self.camera_to_image_key.get(camera)
             if image_key is None:
                 continue
-
+            counts.setdefault(image_key, 0)
             for sample_data in episode_data["data"]:
                 relative_path = sample_data["colors"].get(camera)
                 if not relative_path:
                     continue
-
                 image_path = os.path.join(episode_path, relative_path)
                 if not os.path.exists(image_path):
                     raise FileNotFoundError(f"Image path does not exist: {image_path}")
+                plan.append((image_key, counts[image_key], image_path))
+                counts[image_key] += 1
 
-                image = cv2.imread(image_path)
-                if image is None:
-                    raise RuntimeError(f"Failed to read image: {image_path}")
+        # Preallocate slots so workers can fill them out-of-order without races.
+        images: dict[str, list[np.ndarray | None]] = {k: [None] * n for k, n in counts.items()}
 
-                image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-                # Downsample to the schema target (480, 640). INTER_AREA is the right
-                # choice for shrinks; head cams at 1280x720 get squished 16:9 -> 4:3.
-                image_rgb = cv2.resize(image_rgb, (640, 480), interpolation=cv2.INTER_AREA)
-                images[image_key].append(image_rgb)
+        # cv2.imread releases the GIL, so threads (not processes) are sufficient.
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futures = {ex.submit(self._load_and_process_image, p): (k, i) for (k, i, p) in plan}
+            for fut in futures:
+                k, i = futures[fut]
+                images[k][i] = fut.result()
 
         return images
 

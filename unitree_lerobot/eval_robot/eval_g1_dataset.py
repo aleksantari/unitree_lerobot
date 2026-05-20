@@ -7,7 +7,6 @@ Refer to:   lerobot/lerobot/scripts/eval.py
 import torch
 import tqdm
 import logging
-import time
 import numpy as np
 import matplotlib.pyplot as plt
 from pprint import pformat
@@ -32,7 +31,7 @@ from lerobot.processor import (
 from unitree_lerobot.eval_robot.utils.utils import (
     extract_observation,
     predict_action,
-    EvalRealConfig,
+    OfflineEvalConfig,
 )
 from unitree_lerobot.eval_robot.utils.rerun_visualizer import RerunLogger, visualization_data
 
@@ -44,7 +43,7 @@ logger_mp.setLevel(logging_mp.INFO)
 
 
 def eval_policy(
-    cfg: EvalRealConfig,
+    cfg: OfflineEvalConfig,
     dataset: LeRobotDataset,
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
@@ -63,20 +62,20 @@ def eval_policy(
         preprocessor.reset()
         postprocessor.reset()
 
-    # init pose  dataset.meta.episodes["dataset_from_index"][episode_index]
-    from_idx = dataset.meta.episodes["dataset_from_index"][0]
-    step = dataset[from_idx]
-    to_idx = dataset.meta.episodes["dataset_to_index"][0]
-
-    ground_truth_actions = []
-    predicted_actions = []
-
-    # ===============init robot=====================
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
-    if user_input.lower() == "s":
-        for step_idx in tqdm.tqdm(range(from_idx, to_idx)):
-            loop_start_time = time.perf_counter()
+    if user_input.lower() != "s":
+        return
 
+    for ep_idx in cfg.episodes:
+        from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
+        to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
+
+        policy.reset()
+
+        ground_truth_actions = []
+        predicted_actions = []
+
+        for step_idx in tqdm.tqdm(range(from_idx, to_idx), desc=f"episode {ep_idx}"):
             step = dataset[step_idx]
             observation = extract_observation(step)
 
@@ -99,20 +98,14 @@ def eval_policy(
             if cfg.visualization:
                 visualization_data(step_idx, observation, observation["observation.state"], action_np, rerun_logger)
 
-            # Maintain frequency
-            time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
-
         ground_truth_actions = np.array(ground_truth_actions)
         predicted_actions = np.array(predicted_actions)
 
-        # Get the number of timesteps and action dimensions
         n_timesteps, n_dims = ground_truth_actions.shape
 
-        # Create a figure with subplots for each action dimension
         fig, axes = plt.subplots(n_dims, 1, figsize=(12, 4 * n_dims), sharex=True)
-        fig.suptitle("Ground Truth vs Predicted Actions")
+        fig.suptitle(f"Ground Truth vs Predicted Actions — Episode {ep_idx}")
 
-        # Plot each dimension
         for i in range(n_dims):
             ax = axes[i] if n_dims > 1 else axes
 
@@ -121,18 +114,15 @@ def eval_policy(
             ax.set_ylabel(f"Dim {i + 1}")
             ax.legend()
 
-        # Set common x-label
         axes[-1].set_xlabel("Timestep")
 
         plt.tight_layout()
-        # plt.show()
-
-        time.sleep(1)
-        plt.savefig("figure.png")
+        plt.savefig(f"figure_episode_{ep_idx:03d}.png")
+        plt.close(fig)
 
 
 @parser.wrap()
-def eval_main(cfg: EvalRealConfig):
+def eval_main(cfg: OfflineEvalConfig):
     logging.info(pformat(asdict(cfg)))
 
     # Check device is available

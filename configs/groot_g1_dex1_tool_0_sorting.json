@@ -1,0 +1,108 @@
+{
+    "dataset": {
+        "repo_id": "aleksantari/g1_dex1_tool_0_sorting",
+        "root": null,
+        "episodes": null,
+        "revision": null,
+        "use_imagenet_stats": true,
+        "streaming": false
+    },
+    "env": null,
+    "policy": {
+        "type": "groot",
+        "n_obs_steps": 1,
+        "input_features": {
+            "observation.state": {
+                "type": "STATE",
+                "shape": [16]
+            },
+            "observation.images.cam_left_high": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_right_high": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_left_wrist": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            },
+            "observation.images.cam_right_wrist": {
+                "type": "VISUAL",
+                "shape": [3, 480, 640]
+            }
+        },
+        "output_features": {
+            "action": {
+                "type": "ACTION",
+                "shape": [16]
+            }
+        },
+        "device": "cuda",
+        "use_amp": false,
+        "push_to_hub": false,
+        "repo_id": null,
+        "private": null,
+        "tags": null,
+        "license": null,
+        "pretrained_path": null,
+        "chunk_size": 16,
+        "n_action_steps": 16,
+        "max_state_dim": 64,
+        "max_action_dim": 32,
+        "normalization_mapping": {
+            "VISUAL": "IDENTITY",
+            "STATE": "MEAN_STD",
+            "ACTION": "MEAN_STD"
+        },
+        "image_size": [224, 224],
+        "base_model_path": "nvidia/GR00T-N1.5-3B",
+        "tokenizer_assets_repo": "lerobot/eagle2hg-processor-groot-n1p5",
+        "embodiment_tag": "unitree_g1",
+        "tune_llm": false,
+        "tune_visual": false,
+        "tune_projector": true,
+        "tune_diffusion_model": false,
+        "lora_rank": 0,
+        "lora_alpha": 16,
+        "lora_dropout": 0.1,
+        "lora_full_model": false,
+        "optimizer_lr": 1e-04,
+        "optimizer_betas": [0.95, 0.999],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 1e-05,
+        "warmup_ratio": 0.05,
+        "use_bf16": true,
+        "video_backend": "decord",
+        "balance_dataset_weights": true,
+        "balance_trajectory_weights": true,
+        "dataset_paths": null
+    },
+    "output_dir": null,
+    "job_name": "groot_g1_dex1_tool_0_sorting",
+    "resume": false,
+    "seed": 1000,
+    "num_workers": 8,
+    "batch_size": 16,
+    "steps": 30000,
+    "eval_freq": 0,
+    "log_freq": 100,
+    "save_checkpoint": true,
+    "save_freq": 2500,
+    "use_policy_training_preset": true,
+    "wandb": {
+        "enable": true,
+        "disable_artifact": false,
+        "project": "unitree_lerobot",
+        "entity": null,
+        "notes": null,
+        "run_id": null,
+        "mode": "online"
+    },
+    "eval": {
+        "n_episodes": 50,
+        "batch_size": 50,
+        "use_async_envs": false
+    }
+}

@@ -7,6 +7,7 @@ Refer to:   lerobot/lerobot/scripts/eval.py
 import torch
 import tqdm
 import logging
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from pprint import pformat
@@ -41,6 +42,25 @@ import logging_mp
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
+_REALTIME_BUDGET_HZ = 30.0
+_REALTIME_BUDGET_MS = 1000.0 / _REALTIME_BUDGET_HZ
+
+
+def _log_inference_times(label: str, times_ms: list[float]) -> None:
+    if not times_ms:
+        return
+    arr = np.array(times_ms)
+    budget_ok = arr.max() < _REALTIME_BUDGET_MS
+    logger_mp.info(
+        f"{label} inference (ms): "
+        f"mean={arr.mean():.2f} std={arr.std():.2f} "
+        f"min={arr.min():.2f} max={arr.max():.2f} "
+        f"p50={np.percentile(arr, 50):.2f} p95={np.percentile(arr, 95):.2f} p99={np.percentile(arr, 99):.2f} "
+        f"| n={len(arr)} | first={arr[0]:.2f} (incl. warm-up) "
+        f"| {_REALTIME_BUDGET_HZ:.0f}Hz budget ({_REALTIME_BUDGET_MS:.2f}ms): "
+        f"{'OK' if budget_ok else 'BUSTED'}"
+    )
+
 
 def eval_policy(
     cfg: OfflineEvalConfig,
@@ -66,6 +86,8 @@ def eval_policy(
     if user_input.lower() != "s":
         return
 
+    all_inference_times_ms: list[float] = []
+
     for ep_idx in cfg.episodes:
         from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
         to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
@@ -74,11 +96,13 @@ def eval_policy(
 
         ground_truth_actions = []
         predicted_actions = []
+        inference_times_ms: list[float] = []
 
         for step_idx in tqdm.tqdm(range(from_idx, to_idx), desc=f"episode {ep_idx}"):
             step = dataset[step_idx]
             observation = extract_observation(step)
 
+            infer_start = time.perf_counter()
             action = predict_action(
                 observation,
                 policy,
@@ -90,6 +114,8 @@ def eval_policy(
                 use_dataset=True,
                 robot_type=None,
             )
+            # `predict_action` ends with .to("cpu"), which forces a CUDA sync — so this is the full obs-in→action-out latency.
+            inference_times_ms.append((time.perf_counter() - infer_start) * 1000.0)
             action_np = action.cpu().numpy()
 
             ground_truth_actions.append(step["action"].numpy())
@@ -97,6 +123,9 @@ def eval_policy(
 
             if cfg.visualization:
                 visualization_data(step_idx, observation, observation["observation.state"], action_np, rerun_logger)
+
+        _log_inference_times(f"Episode {ep_idx}", inference_times_ms)
+        all_inference_times_ms.extend(inference_times_ms)
 
         ground_truth_actions = np.array(ground_truth_actions)
         predicted_actions = np.array(predicted_actions)
@@ -119,6 +148,8 @@ def eval_policy(
         plt.tight_layout()
         plt.savefig(f"figure_episode_{ep_idx:03d}.png")
         plt.close(fig)
+
+    _log_inference_times("All episodes", all_inference_times_ms)
 
 
 @parser.wrap()

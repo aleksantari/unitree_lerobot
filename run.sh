@@ -86,10 +86,22 @@ bash -ic 'use_conda unitree-lerobot && lerobot-edit-dataset \
 bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
     --config_path=configs/groot_g1_dex1_tool_0_sorting.json'
 
-# === Train GR00T-N1.5 on the combined sorting+handover dataset ===
+# === Train GR00T-N1.5 on the combined sorting+handover dataset (tier 1: projector only) ===
 # Multi-task variant -- each batch carries one of two task strings, language conditioning live.
+# tune_projector=true, tune_diffusion_model=false. Diffusion head stays at the pretrained prior.
 bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
     --config_path=configs/groot_g1_dex1_tools_combined.json'
+
+# === Train GR00T-N1.5 tier 2 (projector + diffusion model) on combined dataset ===
+# tune_projector=true, tune_diffusion_model=true -- unlocks self.model in the action head.
+# Adjustments vs tier 1 because the diffusion transformer (~hundreds of M params) is now trainable:
+#   batch_size: 20 -> 12     (tier 1 was at ~85% VRAM; tier 2 adds Adam state + grad + activation memory)
+#   optimizer_lr: 1e-4 -> 5e-5 (protect pretrained diffusion head from early-training disruption)
+#   steps: 30000 -> 50000     (lower LR + larger trainable set converge slower; also room past the
+#                              "tier 2 trails tier 1 early then crosses over ~15-25k" pattern)
+# Same dataset.episodes and seed as tier 1 so eval comparison is direct.
+bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
+    --config_path=configs/groot_g1_dex1_tools_combined_tier2.json'
 
 # === Offline eval: predict_chunk against dataset episodes ===
 # Loads a checkpoint, calls policy.predict_action_chunk on every frame of the chosen episodes,
@@ -113,6 +125,30 @@ for step in 005000 020000 050000 095000; do
         --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/${step}/pretrained_model \
         --repo_id=aleksantari/g1_dex1_tool_0_sorting \
         --episodes \"[0,10,20,30]\""
+done
+
+# === Offline eval GR00T-N1.5 on combined dataset (lerobot-gr00t env) ===
+# Same script as the ACT eval -- it's policy-agnostic. Two GR00T-specific notes:
+#   1. GR00T sampling is stochastic (diffusion). Pass --seed=N to lock the sampling and
+#      get reproducible metrics across re-runs of the same checkpoint.
+#   2. Use explicit numeric checkpoint paths (NOT checkpoints/last/) so the eval output
+#      gets a clean step subdir; "last" isn't numeric and the step subdir gets skipped.
+# Combined dataset has 222 episodes: sorting offsets 0-112, handover offsets 113-221.
+# Standard hold-out: [0,10,20,30] from sorting + [113,123,133,143] from handover.
+bash -ic 'use_conda lerobot-gr00t && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tools_combined \
+    --episodes "[0,10,20,30,113,123,133,143]" \
+    --seed=42'
+
+# === Sweep eval across multiple GR00T checkpoints ===
+# Same shape as the ACT sweep, just with the lerobot-gr00t env and a seed for reproducibility.
+for step in 005000 010000 015000 017500; do
+    bash -ic "use_conda lerobot-gr00t && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+        --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/${step}/pretrained_model \
+        --repo_id=aleksantari/g1_dex1_tools_combined \
+        --episodes \"[0,10,20,30,113,123,133,143]\" \
+        --seed=42"
 done
 
 # === Attach to running tmux sessions ===

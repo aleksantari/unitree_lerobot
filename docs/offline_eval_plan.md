@@ -239,16 +239,24 @@ The previously-listed **per-bucket queue-pop vs forward-pass split** is now **ob
 
 6. Spot-check `episodes/episode_000/actions_trajectory.png` — dominant arm dims should track GT closely on the fresh-prediction trace. The fresh-prediction stream should be at least as accurate as a `select_action`-based equivalent since it has no staleness.
 
-## GR00T extension (deferred)
+## GR00T extension
 
-The script is policy-agnostic by construction: it only calls `select_action` and `predict_action_chunk`, both of which exist on `GrootPolicy`. The task string is already routed through `_prep_batch`. The GR00T postprocessor slices `max_action_dim=32` → 16, so output shape matches dataset GT.
+The script is policy-agnostic by construction: it only calls `predict_action_chunk`, which exists on `GrootPolicy`. The task string is already routed through `predict_chunk`. The GR00T postprocessor slices `max_action_dim=32` → 16, so output shape matches dataset GT. **Use the `lerobot-gr00t` conda env**, invoke from the repo root with `python -m` (cwd-on-sys.path finds the package — no install needed).
 
-For the combined-dataset GR00T eval, two small additions will be wanted later:
+**Shipped:**
 
-- Per-task metric breakdown (split episodes by `step["task"]` or by source-of-origin in aggregate index space — sorting offsets 0–112, handover 113–221).
-- A flag like `--eval-task-prompts "sort the tools"` to override the dataset's recorded task and test language-conditioning robustness.
+- **`--seed=N` flag** for diffusion reproducibility. GR00T's flow-matching head seeds with fresh Gaussian noise on every call, so re-runs without a seed produce different `mean_l2` numbers. With `--seed=N` the per-episode seed is `seed + ep_idx` (different across episodes within a run, identical across re-runs). Logged at startup. ACT is unaffected (deterministic anyway).
 
-Both are additive — they don't change the core flow. Once a GR00T checkpoint at `outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/<step>/pretrained_model` is far enough along, the same CLI works (switch env to `lerobot-gr00t`).
+**Still deferred** (additive, no breaking changes):
+
+- **Per-task metric breakdown** (split episodes by `step["task"]` or by source-of-origin in aggregate index space — sorting offsets 0–112, handover 113–221 for the combined dataset). Currently the headline mean_l2 averages all hold-out episodes; per-task split would expose whether GR00T performs better on sorting vs handover.
+- **`--eval-task-prompts "sort the tools"`** flag to override the dataset's recorded task at eval time, for probing language-conditioning robustness.
+
+**Quirks worth remembering:**
+
+- GR00T's chunk is hard-capped at 16 by the pretrained architecture (`chunk_size > 16` in the config is silently truncated). Horizon decay has 16 x-axis points instead of 100.
+- Forward pass is much slower than ACT (~100–300 ms per chunk on RTX 5090 vs ~25 ms). The 30 Hz budget check will report **BUSTED** — this is accurate, not a bug.
+- Use explicit numeric checkpoint paths (`checkpoints/017500/pretrained_model`), not `checkpoints/last/`, so the output dir gets a clean step subdir (`"last"` isn't numeric and the resolver skips the step subdir for non-numeric names).
 
 ## Out of scope (deliberately)
 

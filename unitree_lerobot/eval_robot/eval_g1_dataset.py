@@ -164,6 +164,15 @@ def eval_policy(
     action_dim_names = _resolve_action_dim_names(dataset, action_dim)
     logger_mp.info(f"Action dim names ({action_dim}): {action_dim_names}")
 
+    # ----- Sampling seed (matters for stochastic policies like GR00T's diffusion head) -----
+    if cfg.seed is None:
+        logger_mp.info(
+            "Random seed: None (sampling will be stochastic for diffusion policies like GR00T; "
+            "re-runs will produce different metrics). Pass --seed=N for reproducibility."
+        )
+    else:
+        logger_mp.info(f"Random seed: {cfg.seed} (resolved per-episode as cfg.seed + ep_idx)")
+
     # ----- Cross-episode accumulators -----
     all_inference_times_ms: list[float] = []
     per_episode_metrics: dict[int, dict] = {}
@@ -176,6 +185,12 @@ def eval_policy(
         # Clears the policy's internal chunk queue so each episode starts cold
         # (otherwise the first frame would pop a stale action from the previous episode).
         policy.reset()
+
+        # Per-episode seeding: lock RNG so re-running a single episode subset reproduces the same samples.
+        # The +ep_idx offset means different episodes still use different seeds within one run.
+        if cfg.seed is not None:
+            torch.manual_seed(cfg.seed + ep_idx)
+            np.random.seed(cfg.seed + ep_idx)
 
         # ----- Per-episode output directory -----
         episode_dir = output_dir / "episodes" / f"episode_{ep_idx:03d}"

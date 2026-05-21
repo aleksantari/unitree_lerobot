@@ -110,9 +110,19 @@ def predict_chunk(
 
         observation = preprocessor(observation)
 
-        # Returns the full chunk (B, chunk_size, action_dim); does not touch the policy's internal action queue.
+        # Returns the full chunk (B, chunk_size, action_dim_padded); does not touch the policy's internal action queue.
         action = policy.predict_action_chunk(observation)
+
+        # Reshape to (B*chunk_size, D_padded) before postprocessing so the postprocessor sees a 2D
+        # batch instead of a 3D chunk. GR00T's postprocessor has a `if dim == 3: action = action[:, -1, :]`
+        # branch (processor_groot.py:589-591) that collapses the chunk to its last timestep — correct for
+        # select_action (one popped action at a time) but wrong for us, since we want every chunk position.
+        # Flattening to 2D avoids that branch and lets the postprocessor apply un-padding + un-normalization
+        # batch-element-wise on each chunk step. Reshape back to (B, T, action_dim_real) after.
+        B, T, _ = action.shape
+        action = action.reshape(B * T, -1)
         action = postprocessor(action)
+        action = action.reshape(B, T, -1)
 
         # Squeeze only the batch dim — keep (chunk_size, action_dim).
         action = action.squeeze(0)
@@ -204,6 +214,7 @@ class OfflineEvalConfig:
     root: str = ""
     visualization: bool = False
     output_dir: str | None = None
+    seed: int | None = None
 
     rename_map: dict[str, str] = field(default_factory=dict)
 

@@ -12,6 +12,16 @@
 
 **Why the chunk and not just one action?** Both ACT and GR00T predict a full chunk per forward pass, but most "naive" evaluations only inspect the first action. By capturing and saving the entire chunk, we get a richer measurement at no extra compute cost: we can see not just "what does the policy think I should do *right now*?" but also "what does it think I should do 50 frames from now, given what it sees right now?"
 
+### GR00T-specific notes
+
+The eval script is policy-agnostic, but a few things behave differently when you point it at GR00T-N1.5 instead of ACT:
+
+- **Run in the `lerobot-gr00t` conda env**, not `unitree-lerobot`. From the repo root, `python -m unitree_lerobot.eval_robot.eval_g1_dataset ...` finds the package via cwd-on-sys.path — no editable install needed.
+- **Sampling is stochastic.** GR00T's action head uses flow-matching diffusion with fresh Gaussian noise on every call, so the same checkpoint + same observation produces a slightly different chunk each time. Pass `--seed=N` to lock the sampling and get reproducible metrics across re-runs. Without a seed the script prints a warning and the metrics will drift slightly between invocations.
+- **Forward pass is much slower than ACT.** GR00T is a 3B-parameter model with multi-step diffusion sampling; expect ~100–300 ms per chunk on the RTX 5090 vs ~25 ms for ACT. The 30 Hz real-time budget check (`33.33 ms`) will report **BUSTED** for GR00T — this is accurate, not a bug.
+- **Chunk size is hard-capped at 16** by the pretrained Isaac-GR00T architecture, regardless of what `chunk_size` is set to in the config. The horizon-decay plot therefore has 16 x-axis points instead of ACT's 100, and the per-episode `predictions.npz` is smaller (`(T, 16, action_dim)`).
+- **Use explicit numeric checkpoint paths** (e.g. `checkpoints/017500/pretrained_model`) rather than `checkpoints/last/pretrained_model` so the output directory gets the step subdir cleanly — `"last"` isn't numeric, and the resolver skips the step subdir for non-numeric parent names.
+
 ## The two main per-episode plots
 
 For each held-out episode, the eval produces two PNG files.

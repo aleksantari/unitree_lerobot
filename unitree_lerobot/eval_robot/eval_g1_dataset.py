@@ -31,7 +31,7 @@ from lerobot.processor import (
 
 from unitree_lerobot.eval_robot.utils.utils import (
     extract_observation,
-    predict_action,
+    predict_chunk,
     OfflineEvalConfig,
 )
 from unitree_lerobot.eval_robot.utils.rerun_visualizer import RerunLogger, visualization_data
@@ -73,37 +73,46 @@ def eval_policy(
 
     logger_mp.info(f"Arguments: {cfg}")
 
+    # ----- Optional Rerun visualization sink -----
     if cfg.visualization:
         rerun_logger = RerunLogger()
 
-    # Reset policy and processor if they are provided
+    # ----- One-time reset of policy + processor pipelines -----
     if policy is not None and preprocessor is not None and postprocessor is not None:
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
 
+    # ----- Manual start gate (legacy from the real-robot script; harmless offline) -----
     user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
     if user_input.lower() != "s":
         return
 
+    # ----- Cross-episode latency accumulator -----
     all_inference_times_ms: list[float] = []
 
+    # ===== Per-episode loop =====
     for ep_idx in cfg.episodes:
         from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
         to_idx = dataset.meta.episodes["dataset_to_index"][ep_idx]
 
+        # Clears the policy's internal chunk queue so each episode starts cold
+        # (otherwise the first frame would pop a stale action from the previous episode).
         policy.reset()
 
         ground_truth_actions = []
-        predicted_actions = []
+        predicted_chunks = []
         inference_times_ms: list[float] = []
 
+        # ----- Per-frame inference loop -----
         for step_idx in tqdm.tqdm(range(from_idx, to_idx), desc=f"episode {ep_idx}"):
             step = dataset[step_idx]
             observation = extract_observation(step)
 
+            # `.to("cpu")` at the tail of predict_chunk forces a CUDA sync, so this
+            # captures the real obs-in→action-out latency (incl. GPU work).
             infer_start = time.perf_counter()
-            action = predict_action(
+            chunk = predict_chunk(
                 observation,
                 policy,
                 get_safe_torch_device(policy.config.device),
@@ -114,32 +123,48 @@ def eval_policy(
                 use_dataset=True,
                 robot_type=None,
             )
-            # `predict_action` ends with .to("cpu"), which forces a CUDA sync — so this is the full obs-in→action-out latency.
             inference_times_ms.append((time.perf_counter() - infer_start) * 1000.0)
-            action_np = action.cpu().numpy()
+            chunk_np = chunk.cpu().numpy()  # shape (chunk_size, action_dim)
 
             ground_truth_actions.append(step["action"].numpy())
-            predicted_actions.append(action_np)
+            predicted_chunks.append(chunk_np)
 
             if cfg.visualization:
-                visualization_data(step_idx, observation, observation["observation.state"], action_np, rerun_logger)
+                # Visualize chunk[0] — the action that would deploy if we used n_action_steps=1.
+                visualization_data(step_idx, observation, observation["observation.state"], chunk_np[0], rerun_logger)
 
+        # ----- Per-episode latency summary -----
         _log_inference_times(f"Episode {ep_idx}", inference_times_ms)
         all_inference_times_ms.extend(inference_times_ms)
 
-        ground_truth_actions = np.array(ground_truth_actions)
-        predicted_actions = np.array(predicted_actions)
+        # ----- Stack and derive analysis arrays -----
+        ground_truth_actions = np.array(ground_truth_actions)       # (T, action_dim)
+        predicted_chunks = np.stack(predicted_chunks)               # (T, chunk_size, action_dim)
+        first_action_stream = predicted_chunks[:, 0, :]             # (T, action_dim) — fresh-prediction stream
 
+        T_steps, chunk_size, _ = predicted_chunks.shape
+
+        # ----- Horizon-decay MSE per chunk position k -----
+        # For each k: mean over valid t of MSE(chunk[t, k], GT[t+k]). Positions past episode end stay NaN.
+        horizon_decay_mse = np.full(chunk_size, np.nan)
+        for k in range(chunk_size):
+            valid_frames = T_steps - k
+            if valid_frames <= 0:
+                continue
+            diff = predicted_chunks[:valid_frames, k] - ground_truth_actions[k:]
+            horizon_decay_mse[k] = float(np.mean(diff ** 2))
+
+        # ----- Per-episode trajectory plot: GT vs fresh-prediction stream (chunk[0] per frame) -----
         n_timesteps, n_dims = ground_truth_actions.shape
 
         fig, axes = plt.subplots(n_dims, 1, figsize=(12, 4 * n_dims), sharex=True)
-        fig.suptitle(f"Ground Truth vs Predicted Actions — Episode {ep_idx}")
+        fig.suptitle(f"Ground Truth vs Fresh-Prediction Stream (chunk[0]) — Episode {ep_idx}")
 
         for i in range(n_dims):
             ax = axes[i] if n_dims > 1 else axes
 
             ax.plot(ground_truth_actions[:, i], label="Ground Truth", color="blue")
-            ax.plot(predicted_actions[:, i], label="Predicted", color="red", linestyle="--")
+            ax.plot(first_action_stream[:, i], label="Predicted (chunk[0])", color="red", linestyle="--")
             ax.set_ylabel(f"Dim {i + 1}")
             ax.legend()
 
@@ -149,6 +174,26 @@ def eval_policy(
         plt.savefig(f"figure_episode_{ep_idx:03d}.png")
         plt.close(fig)
 
+        # ----- Per-episode horizon-decay plot -----
+        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+        ax.plot(np.arange(chunk_size), horizon_decay_mse, marker="o", markersize=3, color="purple")
+        ax.set_xlabel("Chunk position k")
+        ax.set_ylabel("Mean squared error")
+        ax.set_title(f"Horizon decay — Episode {ep_idx} (MSE of chunk[k] vs GT[t+k] across t)")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig(f"horizon_decay_episode_{ep_idx:03d}.png")
+        plt.close(fig)
+
+        # ----- Persist raw arrays so any n_action_steps cadence can be derived offline -----
+        np.savez_compressed(
+            f"predictions_episode_{ep_idx:03d}.npz",
+            chunks=predicted_chunks,
+            ground_truth=ground_truth_actions,
+            horizon_decay_mse=horizon_decay_mse,
+        )
+
+    # ===== Cross-episode aggregate latency summary =====
     _log_inference_times("All episodes", all_inference_times_ms)
 
 
@@ -156,16 +201,16 @@ def eval_policy(
 def eval_main(cfg: OfflineEvalConfig):
     logging.info(pformat(asdict(cfg)))
 
-    # Check device is available
+    # ----- Device + cuDNN tuning -----
     device = get_safe_torch_device(cfg.policy.device, log=True)
-
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
+    # ----- Load held-out dataset (metadata + frames) -----
     logging.info("Making policy.")
-
     dataset = LeRobotDataset(repo_id=cfg.repo_id)
 
+    # ----- Load policy weights + the matching pre/postprocessor pipelines from the checkpoint -----
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
     policy.eval()
 
@@ -179,6 +224,7 @@ def eval_main(cfg: OfflineEvalConfig):
         },
     )
 
+    # ----- Run eval inside no_grad + (optional) autocast context -----
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         eval_policy(cfg, dataset, policy, preprocessor, postprocessor)
 

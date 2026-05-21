@@ -79,6 +79,49 @@ def predict_action(
     return action
 
 
+def predict_chunk(
+    observation: dict[str, np.ndarray],
+    policy: PreTrainedPolicy,
+    device: torch.device,
+    preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],
+    postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction],
+    use_amp: bool,
+    task: str | None = None,
+    use_dataset: bool | None = False,
+    robot_type: str | None = None,
+):
+    observation = copy(observation)
+    with (
+        torch.inference_mode(),
+        torch.autocast(device_type=device.type) if device.type == "cuda" and use_amp else nullcontext(),
+    ):
+        for name in observation:
+            if not use_dataset:
+                if not hasattr(observation[name], "unsqueeze"):
+                    continue
+                if "images" in name:
+                    observation[name] = observation[name].type(torch.float32) / 255
+                    observation[name] = observation[name].permute(2, 0, 1).contiguous()
+
+            observation[name] = observation[name].unsqueeze(0).to(device)
+
+        observation["task"] = task if task else ""
+        observation["robot_type"] = robot_type if robot_type else ""
+
+        observation = preprocessor(observation)
+
+        # Returns the full chunk (B, chunk_size, action_dim); does not touch the policy's internal action queue.
+        action = policy.predict_action_chunk(observation)
+        action = postprocessor(action)
+
+        # Squeeze only the batch dim — keep (chunk_size, action_dim).
+        action = action.squeeze(0)
+
+        action = action.to("cpu")
+
+    return action
+
+
 def reset_policy(policy: PreTrainedPolicy):
     policy.reset()
 

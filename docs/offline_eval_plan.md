@@ -11,22 +11,26 @@ The goal is to rewrite this file into a **purely offline analysis tool** — loa
 Design decisions:
 
 - **Pure offline.** Strip robot/IK/EE/Rerun paths from this file. The other two scripts already cover those.
-- **Both inference modes per episode:** open-loop (`predict_action_chunk` every frame) AND closed-loop (`select_action` every frame at deployment cadence). Open-loop measures instantaneous policy quality + horizon decay; closed-loop measures deployment behavior including staleness of the queued chunk.
-- **Episodes specified explicitly** via `--episodes 0 10 20 30` on the CLI (matches the known hold-out and stays trivial to override).
-- **Outputs**: metrics JSON + per-episode plots + aggregate plots, under `outputs/train/<run>/eval/<dataset>/` adjacent to the checkpoint.
+- **Single inference path: `predict_chunk` every frame.** Call `policy.predict_action_chunk()` once per frame, save the full `(chunk_size, action_dim)` chunk. Both "open-loop fresh-prediction" and any "closed-loop deployed-at-`n_action_steps=k`" analysis are recovered in post-processing from the saved chunks — no second inference run needed. See [`docs/action_generation.md`](action_generation.md) for the research that grounds this decision; the key fact is that the deployed action at any cadence k is `chunks[(t // k) * k][t % k]`, so one eval run unlocks every cadence's analysis.
+- **Episodes specified explicitly** via `--episodes "[0,10,20,30]"` on the CLI (matches the known hold-out and stays trivial to override).
+- **Outputs**: metrics JSON + per-episode plots + aggregate plots, eventually under `outputs/train/<run>/eval/<dataset>/` adjacent to the checkpoint. Today's increment writes per-episode `figure_*.png`, `horizon_decay_*.png`, and `predictions_*.npz` to CWD; the structured layout lands later.
 
-## File to modify
+## Files involved
 
-[`unitree_lerobot/eval_robot/eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py) — full rewrite. New length ~280–350 lines.
+Primary script: [`unitree_lerobot/eval_robot/eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py) — incrementally refactored, not a single big-bang rewrite.
 
-No other files need to be touched. We will reuse:
+Shared helpers we reuse / extend in [`unitree_lerobot/eval_robot/utils/utils.py`](../unitree_lerobot/eval_robot/utils/utils.py):
 
-- `extract_observation(step)` at [`unitree_lerobot/eval_robot/utils/utils.py:20-32`](../unitree_lerobot/eval_robot/utils/utils.py#L20-L32) — handles HWC→CHW transpose
-- `make_policy` and `make_pre_post_processors` from `lerobot.policies.factory` — checkpoint load + pre/postprocessor pipelines
-- `LeRobotDataset` + `dataset.meta.episodes` (the `dataset_from_index` / `dataset_to_index` arrays per episode)
-- Both `policy.select_action(batch)` and `policy.predict_action_chunk(batch)` on `ACTPolicy` ([`modeling_act.py:98-133`](../unitree_lerobot/lerobot/src/lerobot/policies/act/modeling_act.py#L98-L133)) and `GrootPolicy` ([`modeling_groot.py:124-163`](../unitree_lerobot/lerobot/src/lerobot/policies/groot/modeling_groot.py#L124-L163)). GR00T's postprocessor strips the 32-dim padding back to the real 16-dim action — no special handling at the call site.
+- `extract_observation(step)` — HWC→CHW transpose for dataset frames.
+- `predict_action(...)` — single-step wrapper around `policy.select_action`. **Still used by `eval_g1.py` and `eval_g1_sim.py`**, not by the offline eval anymore.
+- `predict_chunk(...)` — **the chunk-returning sibling**. Calls `policy.predict_action_chunk`, returns `(chunk_size, action_dim)` on CPU. This is the load-bearing call for the offline path.
+- `OfflineEvalConfig` — minimal config for the offline eval (repo_id, episodes, policy, root, visualization, rename_map). Future fields (output_dir, modes, save_predictions) defer to later increments.
 
-We will **not** reuse `predict_action(...)` in [`unitree_lerobot/eval_robot/utils/utils.py:35-79`](../unitree_lerobot/eval_robot/utils/utils.py#L35-L79) — it wraps only `select_action` and embeds robot-flow assumptions. The new file inlines small `_run_open_loop` and `_run_closed_loop` helpers that share an input-prep function but call the two policy methods directly.
+Other reused machinery:
+
+- `make_policy` and `make_pre_post_processors` from `lerobot.policies.factory` — checkpoint load + pre/postprocessor pipelines.
+- `LeRobotDataset` + `dataset.meta.episodes["dataset_from_index"/"dataset_to_index"]` for per-episode frame ranges.
+- `policy.predict_action_chunk(batch)` on `ACTPolicy` ([`modeling_act.py:124-133`](../unitree_lerobot/lerobot/src/lerobot/policies/act/modeling_act.py#L124-L133)) and `GrootPolicy` ([`modeling_groot.py:124-153`](../unitree_lerobot/lerobot/src/lerobot/policies/groot/modeling_groot.py#L124-L153)). GR00T's postprocessor strips the 32-dim padding back to the real 16-dim action — no special handling at the call site.
 
 ## New CLI / config
 
@@ -57,70 +61,83 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
 
 ## Inference flow per episode
 
+One pass per frame using `predict_chunk`. The full chunk is captured at every step; everything else (fresh-prediction stream, deployed-at-any-cadence stream, horizon decay) is derived from those saved chunks in post-processing.
+
 ```python
 for ep_idx in cfg.episodes:
     from_idx = dataset.meta.episodes["dataset_from_index"][ep_idx]
     to_idx   = dataset.meta.episodes["dataset_to_index"][ep_idx]
 
-    # ------- open-loop: predict_action_chunk every frame -------
-    policy.reset()
-    open_chunks = []          # list of (chunk_size, action_dim) arrays, len = T
-    for t in range(from_idx, to_idx):
-        step = dataset[t]
-        batch = _prep_batch(step, device)            # adds batch dim, attaches task string
-        batch = preprocessor(batch)
-        with torch.inference_mode():
-            chunk = policy.predict_action_chunk(batch)        # (1, chunk_size, A_pad-or-A)
-        chunk = postprocessor(chunk).squeeze(0).cpu().numpy() # (chunk_size, action_dim)
-        open_chunks.append(chunk)
+    policy.reset()                                  # defensive; predict_chunk doesn't touch the queue but other state may exist
+    predicted_chunks = []                           # list of (chunk_size, action_dim) np arrays, len = T
 
-    # ------- closed-loop: deployment cadence -------
-    policy.reset()
-    closed_actions = []       # (T, action_dim)
-    for t in range(from_idx, to_idx):
+    for t in tqdm.tqdm(range(from_idx, to_idx), desc=f"episode {ep_idx}"):
         step = dataset[t]
-        batch = _prep_batch(step, device)
-        batch = preprocessor(batch)
-        with torch.inference_mode():
-            action = policy.select_action(batch)               # uses internal queue
-        action = postprocessor(action).squeeze(0).cpu().numpy()
-        closed_actions.append(action)
+        observation = extract_observation(step)
+        chunk = predict_chunk(observation, policy, device, preprocessor, postprocessor,
+                              use_amp=policy.config.use_amp, task=step["task"],
+                              use_dataset=True, robot_type=None)
+        predicted_chunks.append(chunk.cpu().numpy())
 
+    predicted_chunks = np.stack(predicted_chunks)   # (T, chunk_size, action_dim)
     gt_actions = np.stack([dataset[t]["action"].numpy() for t in range(from_idx, to_idx)])
 
-    _compute_and_save(ep_idx, gt_actions, open_chunks, np.stack(closed_actions), out_dir)
+    # ----- Derive analyses from the saved chunks (no further inference) -----
+    first_action_stream = predicted_chunks[:, 0, :]                          # (T, action_dim) — fresh prediction per frame
+    # deployed_at_k = np.array([predicted_chunks[(t // k) * k, t % k] for t in range(T)])   # any cadence, any time
+
+    # Horizon decay: for each chunk position k, mean MSE(chunks[t, k], gt[t+k]) across valid t.
+    T = len(gt_actions)
+    horizon_decay_mse = np.full(predicted_chunks.shape[1], np.nan)
+    for k in range(predicted_chunks.shape[1]):
+        if T - k <= 0:
+            continue
+        diff = predicted_chunks[:T-k, k] - gt_actions[k:]
+        horizon_decay_mse[k] = float((diff ** 2).mean())
+
+    np.savez_compressed(f"predictions_episode_{ep_idx:03d}.npz",
+                        chunks=predicted_chunks, ground_truth=gt_actions,
+                        horizon_decay_mse=horizon_decay_mse)
 ```
 
 Key behaviours:
 
-- `policy.reset()` is called between modes and between episodes so the action queue starts empty.
-- Closed-loop is cheap for ACT (chunk=100 → 1 forward pass per 100 frames). Open-loop is the expensive arm (1 per frame).
-- `_prep_batch` builds `{ "observation.state": ..., "observation.images.*": ..., "task": step["task"] }` with batch dim 1 on the policy device. Task string passes through harmlessly for ACT and is required for GR00T.
+- **One forward pass per frame.** T forward passes per episode (vs ~T/n_action_steps for the old `select_action` path). For ACT chunk=100 with a 600-frame episode that's 600 instead of 6 — but at offline eval time there's no real-time budget to worry about.
+- **`predict_chunk` does not touch the policy's internal action queue** — it bypasses the queue logic entirely. We still call `policy.reset()` between episodes for defensive hygiene (in case any other policy state exists).
+- **No second inference run.** The "open-loop vs closed-loop" duality from prior iterations of this doc is recovered in post: open-loop = `predicted_chunks[:, 0, :]`, closed-loop at any cadence k = `predicted_chunks[(t // k) * k, t % k]`.
+- **Why saving chunks matters.** `predictions_*.npz` contains the full `(T, chunk_size, action_dim)` array. Future analyses ("what would `n_action_steps=20` have looked like?" / "what's chunk variance at k=50?" / etc.) load the npz and slice — no GPU work.
 
 ## Metrics computed
 
-Per-mode, per-episode (stored in `metrics.json` under `episodes.<N>.<mode>`):
+All metrics are **derived from the saved `predicted_chunks` array** (no parallel inference modes). Each metric below is a function of `predicted_chunks: (T, chunk_size, action_dim)` and `ground_truth_actions: (T, action_dim)`.
 
-| Metric | Shape | Definition |
+**Already shipped:**
+
+| Metric | Shape | Derivation |
 | --- | --- | --- |
-| `mse_per_dim` | `(action_dim,)` | mean squared error per action dimension |
-| `mae_per_dim` | `(action_dim,)` | mean absolute error per dim |
-| `rmse_per_dim` | `(action_dim,)` | sqrt of `mse_per_dim` |
-| `l2_per_step` | `(T,)` | per-timestep L2 norm of (pred − gt) — drives error-over-time plot |
-| `mean_l2` | scalar | mean of `l2_per_step` — single-number episode score |
+| `horizon_decay_mse` | `(chunk_size,)` | for each `k`: `mean_{valid t} MSE(predicted_chunks[t, k], ground_truth[t+k])` (positions past episode end are NaN). Saved into `predictions_episode_NNN.npz`. |
 
-Additional for open-loop only (uses the full predicted chunks):
+**To add in later increments (all derivable from the same `predicted_chunks`):**
 
-| Metric | Shape | Definition |
+| Metric | View | Derivation |
 | --- | --- | --- |
-| `horizon_decay_mse` | `(chunk_size,)` | for each position `k` in the chunk, mean over all frames `t` of `MSE(open_chunks[t][k], gt[t+k])` (truncated at episode end) |
+| `mse_per_dim` (fresh) | open-loop | per-dim MSE between `predicted_chunks[:, 0, :]` and `ground_truth` |
+| `mae_per_dim` (fresh) | open-loop | per-dim mean absolute error of same |
+| `rmse_per_dim` (fresh) | open-loop | sqrt of mse |
+| `l2_per_step` (fresh) | open-loop | per-timestep L2 norm of `(predicted_chunks[:, 0, :] - ground_truth)` — drives error-over-time plot |
+| `mean_l2` (fresh) | open-loop | scalar; mean of `l2_per_step` |
+| `mse_per_dim` (deployed @k) | derived closed-loop | per-dim MSE between `predicted_chunks[(t // k) * k, t % k]` (for each t) and `ground_truth` — for any `k` |
+| Same metrics, deployed @k | derived closed-loop | same construction for any k ∈ [1, chunk_size] — no extra inference |
+| `closed_to_open_ratio` | comparison | `mean_l2_deployed_at_k / mean_l2_fresh` — quantifies the staleness penalty at any chosen k. ≥ 1.0 in healthy runs (staleness only hurts). |
 
-Aggregate across episodes (stored top-level in `metrics.json`):
+Aggregate across episodes (to land with `metrics.json` later):
 
-- Mean and std of `mean_l2` across episodes (per mode)
-- Mean per-dim MSE/MAE/RMSE across episodes (per mode)
-- Mean `horizon_decay_mse` across episodes (open-loop)
-- A `comparison` block: `closed_loop.mean_l2 / open_loop.mean_l2` — diagnoses staleness penalty (≥ 1.0 in healthy runs)
+- Mean and std of `mean_l2` across episodes (fresh + deployed-at-some-k)
+- Mean per-dim MSE/MAE/RMSE across episodes
+- Mean `horizon_decay_mse` across episodes — the cross-episode horizon curve
+- `comparison` block: ratios at the deployment k we settle on
+
+The key reframe vs prior versions of this doc: **the "open-loop vs closed-loop" duality is no longer two inference runs**, it's two views of the same saved tensor. The deployment cadence k can be chosen post-hoc, or swept post-hoc, without re-running inference.
 
 ## Output layout
 
@@ -150,6 +167,20 @@ outputs/train/<run>/eval/<dataset_safe_name>/
 
 Action dim auto-discovered from `policy.config.output_features["action"].shape[0]`, so plotting works for any action_dim.
 
+## Inference latency monitoring
+
+Per-step wall-clock is timed around the `predict_chunk()` call and summarized per episode + aggregate (mean / std / min / max / p50 / p95 / p99) with a 30 Hz real-time budget check. Because `predict_chunk()` ends with `.to("cpu")`, the timer captures the full GPU work — no manual `torch.cuda.synchronize()` needed.
+
+Status: shipped as `_log_inference_times` in [`eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py).
+
+**Consequence of the chunk-per-frame design: latency is now unimodal in the offline eval.** Every frame is a real forward pass; there are no queue-pop dequeue frames. `mean ≈ p50 ≈ p95` and `max` is within ~10–20% of those (modulo the warm-up first call). The headline numbers are now directly comparable to the real-time budget without per-bucket gymnastics.
+
+One refinement still worth folding in once we have eval data:
+
+1. **Strip the first frame from stats and report it separately.** cudnn benchmark + CUDA JIT make the first call multiples slower than steady state. The implementation already reports `first=X (incl. warm-up)` alongside the headline numbers, but `max`, `p95`, `p99` and the budget check still include that warm-up frame. Replace those with the slice `arr[1:]` so they reflect steady-state, keep `first` as the explicit cold-start indicator.
+
+The previously-listed **per-bucket queue-pop vs forward-pass split** is now **obsolete for offline eval** — chunks-per-frame eliminates the bimodal pattern. It's still relevant for the on-robot script (`eval_g1.py`), which uses `select_action` at deployment cadence; when we adapt that script, the bucket-split refinement applies there.
+
 ## Verification
 
 1. Run the ACT eval (env: `unitree-lerobot`):
@@ -158,21 +189,35 @@ Action dim auto-discovered from `policy.config.output_features["action"].shape[0
    bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
        --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
        --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-       --episodes 0 10 20 30'
+       --episodes "[0,10,20,30]"'
    ```
 
-   Expected:
-   - Completes 4 episodes × 2 modes with progress bars (open-loop dominates wall-clock).
-   - Writes `outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/eval/aleksantari__g1_dex1_tool_0_sorting/metrics.json` and the plot tree above.
+   Expected on completion (in CWD; structured-dir layout is a later increment):
+   - `figure_episode_000.png` ... `figure_episode_030.png` — GT vs fresh-prediction stream.
+   - `horizon_decay_episode_000.png` ... `horizon_decay_episode_030.png` — curves rising left-to-right.
+   - `predictions_episode_000.npz` ... `predictions_episode_030.npz` — each carries `chunks`, `ground_truth`, `horizon_decay_mse`.
+   - Latency log lines per episode + aggregate, showing **unimodal stats** (mean ≈ p50 ≈ p95, `first` ≫ rest due to warm-up).
 
-2. Sanity-check `metrics.json`:
-   - All four episodes present under `episodes`.
-   - Per-dim MSE is small for the gripper dims (small range) and larger for the wrist/elbow dims.
-   - `comparison.closed_to_open_ratio` ≥ 1.0 (closed-loop should never beat open-loop on average — staleness only hurts).
+2. Sanity-check a saved `.npz`:
 
-3. Spot-check `aggregate/horizon_decay.png` — should be monotonically (or near-monotonically) increasing with chunk position. If it's flat, suspect a bug in chunk indexing.
+   ```python
+   d = np.load("predictions_episode_000.npz")
+   d["chunks"].shape           # (T, chunk_size, action_dim) — e.g. (600, 100, 16) for ACT
+   d["ground_truth"].shape     # (T, action_dim)
+   d["horizon_decay_mse"]      # (chunk_size,)
+   d["horizon_decay_mse"][0] < d["horizon_decay_mse"][-1]   # True — error grows with horizon
+   ```
 
-4. Spot-check one `episodes/episode_000/actions_trajectory.png` — the three traces should track each other on the dominant arm dims and diverge most on transient/contact frames.
+3. **Post-processing smoke test** (the design's core payoff): from a saved `.npz`, derive what `n_action_steps=100` would have deployed and confirm it matches the prior `select_action`-based eval — without any new inference.
+
+   ```python
+   k = 100
+   deployed = np.array([d["chunks"][(t // k) * k, t % k] for t in range(len(d["ground_truth"]))])
+   ```
+
+4. Spot-check `horizon_decay_episode_NNN.png` — should rise from near-zero at `k=0` (fresh-prediction quality) to larger at `k=chunk_size-1`. If it's flat, suspect indexing bugs in the `t+k` truncation.
+
+5. Spot-check `figure_episode_000.png` — dominant arm dims should track GT closely on the fresh-prediction trace. The fresh-prediction stream should be at least as accurate as the prior `select_action`-based plot since it has no staleness.
 
 ## GR00T extension (deferred)
 
@@ -192,3 +237,7 @@ Both are additive — they don't change the core flow. Once a GR00T checkpoint a
 - MP4 videos with action overlays — defer until the metrics view is in heavy use and we know what's worth animating.
 - Auto-detecting held-out from `train_config.json` — explicit `--episodes` is simpler and matches the current mental model.
 - Per-joint plots in physical units (degrees, etc.) — GT and pred share normalized units so the comparison is already correct; unit conversion is a later polish item.
+
+## Related docs
+
+- [`docs/action_generation.md`](action_generation.md) — research report on how this repo (and upstream lerobot) generates actions. Grounds the chunk-based inference design used here: the load-bearing finding is that `predict_action_chunk` extracts the *full* policy output per forward pass at no extra GPU cost, and the deployed action stream at any cadence k is recoverable in post via `chunks[(t // k) * k, t % k]`. Also covers ACT temporal ensembling (built into lerobot, off by default), GR00T's stochasticity and 16-step hard cap, and other design implications.

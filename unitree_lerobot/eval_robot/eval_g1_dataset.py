@@ -65,14 +65,22 @@ def _log_inference_times(label: str, times_ms: list[float]) -> None:
 
 
 def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
-    # Honors cfg.output_dir if set. Otherwise lands under the checkpoint's run dir at <run>/eval/<dataset_safe>.
+    # Honors cfg.output_dir if set. Otherwise lands under the checkpoint's run dir at
+    # <run>/eval/<dataset_safe>/<step>, so evals on different checkpoints don't clobber each other.
+    # The step subdir is omitted if the path doesn't follow the canonical lerobot checkpoint layout
+    # (<run>/checkpoints/<step>/pretrained_model) — detected by isdigit() on the parent dir name.
     # Fallback for random-weight runs (no pretrained_path): write to ./eval_outputs/<dataset_safe>.
     if cfg.output_dir is not None:
         return Path(cfg.output_dir)
     if cfg.policy is not None and cfg.policy.pretrained_path is not None:
-        run_dir = Path(cfg.policy.pretrained_path).parent.parent.parent
+        ckpt_path = Path(cfg.policy.pretrained_path)
+        run_dir = ckpt_path.parent.parent.parent
         dataset_safe = cfg.repo_id.replace("/", "__")
-        return run_dir / "eval" / dataset_safe
+        eval_dir = run_dir / "eval" / dataset_safe
+        step_dir_name = ckpt_path.parent.name
+        if step_dir_name.isdigit():
+            eval_dir = eval_dir / step_dir_name
+        return eval_dir
     return Path("eval_outputs") / cfg.repo_id.replace("/", "__")
 
 
@@ -145,11 +153,6 @@ def eval_policy(
         policy.reset()
         preprocessor.reset()
         postprocessor.reset()
-
-    # ----- Manual start gate (legacy from the real-robot script; harmless offline) -----
-    user_input = input("Please enter the start signal (enter 's' to start the subsequent program):")
-    if user_input.lower() != "s":
-        return
 
     # ----- Resolve and prepare output directory -----
     output_dir = _resolve_output_dir(cfg)
@@ -243,7 +246,9 @@ def eval_policy(
 
             ax.plot(ground_truth_actions[:, i], label="Ground Truth", color="blue")
             ax.plot(first_action_stream[:, i], label="Predicted (chunk[0])", color="red", linestyle="--")
-            ax.set_ylabel(action_dim_names[i])
+            # Arm joint values are in radians (G1 DDS convention); gripper units are policy-specific so leave unlabeled.
+            unit_suffix = "" if "Gripper" in action_dim_names[i] else " (rad)"
+            ax.set_ylabel(f"{action_dim_names[i]}{unit_suffix}")
             ax.legend()
 
         axes[-1].set_xlabel("Timestep")

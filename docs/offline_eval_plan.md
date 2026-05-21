@@ -143,7 +143,7 @@ The key reframe vs prior versions of this doc: **the "open-loop vs closed-loop" 
 **Shipped** (default location is sibling to the policy checkpoint, override with `--output_dir=<path>`):
 
 ```
-outputs/train/<run>/eval/<dataset_safe_name>/
+outputs/train/<run>/eval/<dataset_safe_name>/<step>/
 ├── metrics.json                     # per-episode + aggregate headline numbers
 └── episodes/
     └── episode_<NNN>/
@@ -152,17 +152,21 @@ outputs/train/<run>/eval/<dataset_safe_name>/
         └── predictions.npz          # chunks, ground_truth, horizon_decay_mse
 ```
 
-**To add in later increments:**
+The `<step>` subdirectory keeps evals of different checkpoints from the same training run distinct (essential since we sweep checkpoints during training). Step is inferred from the canonical lerobot path `checkpoints/<step>/pretrained_model`; if the path is non-canonical the step subdir is omitted (`<dataset_safe>/` directly).
+
+**To add in later increments** (per-step aggregates land alongside the per-episode tree):
 
 ```
-outputs/train/<run>/eval/<dataset_safe_name>/
+outputs/train/<run>/eval/<dataset_safe_name>/<step>/
 └── aggregate/
     ├── per_dim_error.png            # bar: per-dim MSE across episodes
     ├── horizon_decay.png            # line: mean horizon decay across episodes
     └── episode_summary.png          # bar: mean_l2 per episode
 ```
 
-`<dataset_safe_name>` = `repo_id.replace("/", "__")` for filesystem safety. Resolution lives in `_resolve_output_dir(cfg)` in the script: honors `cfg.output_dir` if set, otherwise walks up from `cfg.policy.pretrained_path` to the run dir and appends `eval/<dataset_safe>`. Falls back to `./eval_outputs/<dataset_safe>` if the policy was trained from scratch (no pretrained path).
+Cross-checkpoint comparison plots (e.g., `mean_l2` vs training step) would live one level up at `eval/<dataset_safe_name>/checkpoints_summary.png` or similar — TBD when we have multiple eval runs to compare.
+
+`<dataset_safe_name>` = `repo_id.replace("/", "__")` for filesystem safety. Resolution lives in `_resolve_output_dir(cfg)` in the script: honors `cfg.output_dir` if set, otherwise walks up from `cfg.policy.pretrained_path` to the run dir and appends `eval/<dataset_safe>/<step>`. Falls back to `./eval_outputs/<dataset_safe>` if the policy was trained from scratch (no pretrained path).
 
 ## Plotting
 

@@ -171,10 +171,10 @@ This means we never need a second eval run to study a different cadence — one 
 
 ## Output directory layout
 
-Everything from a single eval run lands under one directory, by default adjacent to the policy's training checkpoint:
+Everything from a single eval run lands under one directory, by default adjacent to the policy's training checkpoint. The path is tagged with the checkpoint *step* as the deepest subdirectory so that evaluating multiple checkpoints from the same training run does not overwrite earlier results:
 
 ```
-outputs/train/<training_run>/eval/<dataset_safe_name>/
+outputs/train/<training_run>/eval/<dataset_safe_name>/<step>/
 ├── metrics.json
 └── episodes/
     ├── episode_000/
@@ -186,7 +186,14 @@ outputs/train/<training_run>/eval/<dataset_safe_name>/
     └── ...
 ```
 
-`<dataset_safe_name>` is the HuggingFace repo id with `/` replaced by `__` (so `aleksantari/g1_dex1_tool_0_sorting` becomes `aleksantari__g1_dex1_tool_0_sorting`).
+`<dataset_safe_name>` is the HuggingFace repo id with `/` replaced by `__` (so `aleksantari/g1_dex1_tool_0_sorting` becomes `aleksantari__g1_dex1_tool_0_sorting`). `<step>` is the checkpoint step (e.g., `005000`, `095000`) inferred from the canonical lerobot layout `checkpoints/<step>/pretrained_model`; if the policy path doesn't match that layout the step subdir is omitted.
+
+Listing all evaluated checkpoints for one dataset is therefore one `ls` away:
+
+```bash
+ls outputs/train/<training_run>/eval/<dataset_safe_name>/
+# → 005000  010000  095000  ...
+```
 
 Override the output location with `--output_dir=<path>` on the CLI if you need to write somewhere else.
 

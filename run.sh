@@ -91,6 +91,30 @@ bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
 bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
     --config_path=configs/groot_g1_dex1_tools_combined.json'
 
+# === Offline eval: predict_chunk against dataset episodes ===
+# Loads a checkpoint, calls policy.predict_action_chunk on every frame of the chosen episodes,
+# and produces per-episode trajectory + horizon-decay plots, a predictions.npz with the raw
+# (T, chunk_size, action_dim) tensor, and a metrics.json with per-dim MSE/MAE, mean_l2, and
+# horizon-decay (per episode + cross-episode aggregate). Joint names (e.g. kLeftShoulderPitch)
+# are pulled from the dataset's action feature schema and used as subplot ylabels + metrics.json keys.
+# Outputs land at <run>/eval/<dataset_safe>/<step>/ -- step-stamped so multi-checkpoint sweeps
+# don't clobber each other. Override with --output_dir=<path> if needed.
+# --episodes is our hold-out [0,10,20,30] for the sorting dataset; swap to any indices to spot-check.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --episodes "[0,10,20,30]"'
+
+# === Sweep eval across multiple ACT checkpoints ===
+# Each iteration writes to its own <step>/ subfolder. Adjust the step list to whatever
+# checkpoints you want to compare (use `ls outputs/train/<run>/checkpoints/` to enumerate).
+for step in 005000 020000 050000 095000; do
+    bash -ic "use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+        --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/${step}/pretrained_model \
+        --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+        --episodes \"[0,10,20,30]\""
+done
+
 # === Attach to running tmux sessions ===
 tmux attach -t train_act          # ACT training
 tmux attach -t convert_sorting    # tool_0_sorting conversion

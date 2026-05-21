@@ -78,10 +78,12 @@ def eval_policy(
         robot_interface = setup_robot_interface(cfg)
         logger_mp.info("Robot interface ready.")
 
-        # Unpack interfaces for convenience
+        # --- Unpack interfaces for convenience ---
+        # robot_interface
         arm_ctrl, arm_ik, ee_shared_mem, arm_dof, ee_dof = (
             robot_interface[key] for key in ["arm_ctrl", "arm_ik", "ee_shared_mem", "arm_dof", "ee_dof"]
         )
+        # image_info
         tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam = (
             image_info[key]
             for key in [
@@ -118,16 +120,10 @@ def eval_policy(
                 loop_start_time = time.perf_counter()
                 # 1. Get Observations
                 observation, current_arm_q = process_images_and_observations(
-                    tv_img_array, 
-                    wrist_img_array, 
-                    tv_img_shape, 
-                    wrist_img_shape, 
-                    is_binocular, 
-                    has_wrist_cam, 
-                    arm_ctrl
+                    tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam, arm_ctrl
                 )
                 left_ee_state = right_ee_state = np.array([])
-                
+
                 if cfg.ee:
                     with ee_shared_mem["lock"]:
                         full_state = np.array(ee_shared_mem["state"][:])

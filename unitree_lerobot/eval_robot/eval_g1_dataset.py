@@ -94,7 +94,7 @@ def _compute_episode_metrics(
     error = first_action_stream - ground_truth
     return {
         "mean_l2": float(np.linalg.norm(error, axis=1).mean()),
-        "mse_per_dim": np.mean(error ** 2, axis=0).tolist(),
+        "mse_per_dim": np.mean(error**2, axis=0).tolist(),
         "mae_per_dim": np.mean(np.abs(error), axis=0).tolist(),
         "horizon_decay_mse": horizon_decay_mse.tolist(),
     }
@@ -234,9 +234,9 @@ def eval_policy(
         all_inference_times_ms.extend(inference_times_ms)
 
         # ----- Stack and derive analysis arrays -----
-        ground_truth_actions = np.array(ground_truth_actions)       # (T, action_dim)
-        predicted_chunks = np.stack(predicted_chunks)               # (T, chunk_size, action_dim)
-        first_action_stream = predicted_chunks[:, 0, :]             # (T, action_dim) — fresh-prediction stream
+        ground_truth_actions = np.array(ground_truth_actions)  # (T, action_dim)
+        predicted_chunks = np.stack(predicted_chunks)  # (T, chunk_size, action_dim)
+        first_action_stream = predicted_chunks[:, 0, :]  # (T, action_dim) — fresh-prediction stream
 
         T_steps, chunk_size, _ = predicted_chunks.shape
 
@@ -248,7 +248,7 @@ def eval_policy(
             if valid_frames <= 0:
                 continue
             diff = predicted_chunks[:valid_frames, k] - ground_truth_actions[k:]
-            horizon_decay_mse[k] = float(np.mean(diff ** 2))
+            horizon_decay_mse[k] = float(np.mean(diff**2))
 
         # ----- Per-episode trajectory plot: GT vs fresh-prediction stream (chunk[0] per frame) -----
         n_timesteps, n_dims = ground_truth_actions.shape

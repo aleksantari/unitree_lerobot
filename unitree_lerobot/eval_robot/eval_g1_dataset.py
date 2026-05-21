@@ -4,12 +4,14 @@ Refer to:   lerobot/lerobot/scripts/eval.py
             lerobot/robot_devices/control_utils.py
 """
 
+import json
 import torch
 import tqdm
 import logging
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+from pathlib import Path
 from pprint import pformat
 from typing import Any
 from dataclasses import asdict
@@ -62,6 +64,67 @@ def _log_inference_times(label: str, times_ms: list[float]) -> None:
     )
 
 
+def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
+    # Honors cfg.output_dir if set. Otherwise lands under the checkpoint's run dir at <run>/eval/<dataset_safe>.
+    # Fallback for random-weight runs (no pretrained_path): write to ./eval_outputs/<dataset_safe>.
+    if cfg.output_dir is not None:
+        return Path(cfg.output_dir)
+    if cfg.policy is not None and cfg.policy.pretrained_path is not None:
+        run_dir = Path(cfg.policy.pretrained_path).parent.parent.parent
+        dataset_safe = cfg.repo_id.replace("/", "__")
+        return run_dir / "eval" / dataset_safe
+    return Path("eval_outputs") / cfg.repo_id.replace("/", "__")
+
+
+def _compute_episode_metrics(
+    predicted_chunks: np.ndarray,
+    ground_truth: np.ndarray,
+    horizon_decay_mse: np.ndarray,
+) -> dict:
+    # All metrics here are over the fresh-prediction stream — chunk[0] per frame, no deployment staleness.
+    first_action_stream = predicted_chunks[:, 0, :]
+    error = first_action_stream - ground_truth
+    return {
+        "mean_l2": float(np.linalg.norm(error, axis=1).mean()),
+        "mse_per_dim": np.mean(error ** 2, axis=0).tolist(),
+        "mae_per_dim": np.mean(np.abs(error), axis=0).tolist(),
+        "horizon_decay_mse": horizon_decay_mse.tolist(),
+    }
+
+
+def _aggregate_metrics(per_episode: dict[int, dict]) -> dict:
+    # nanmean across episodes so short episodes (which leave trailing NaN in horizon_decay_mse) don't poison the aggregate curve.
+    if not per_episode:
+        return {}
+    mean_l2s = np.array([m["mean_l2"] for m in per_episode.values()])
+    mse_per_dims = np.stack([np.array(m["mse_per_dim"]) for m in per_episode.values()])
+    horizon_decays = np.stack([np.array(m["horizon_decay_mse"]) for m in per_episode.values()])
+    return {
+        "mean_l2_mean": float(mean_l2s.mean()),
+        "mean_l2_std": float(mean_l2s.std()),
+        "mse_per_dim_mean": np.nanmean(mse_per_dims, axis=0).tolist(),
+        "horizon_decay_mse_mean": np.nanmean(horizon_decays, axis=0).tolist(),
+        "n_episodes": len(per_episode),
+    }
+
+
+def _resolve_action_dim_names(dataset: LeRobotDataset, action_dim: int) -> list[str]:
+    # Reads dataset.meta.features["action"]["names"] (a list-of-lists per the lerobot per-axis convention).
+    # The converter at convert_unitree_json_to_lerobot.py populates this from ROBOT_CONFIGS at dataset build time,
+    # so the dataset is the authoritative record. Falls back to "Dim N" if missing/malformed.
+    try:
+        names = dataset.meta.features["action"]["names"][0]
+        if isinstance(names, (list, tuple)) and len(names) == action_dim:
+            return list(names)
+    except (KeyError, TypeError, IndexError):
+        pass
+    logger_mp.warning(
+        f"Could not read action dim names from dataset.meta.features['action']['names']; "
+        f"falling back to generic 'Dim N' labels (expected {action_dim} names)."
+    )
+    return [f"Dim {i + 1}" for i in range(action_dim)]
+
+
 def eval_policy(
     cfg: OfflineEvalConfig,
     dataset: LeRobotDataset,
@@ -88,8 +151,19 @@ def eval_policy(
     if user_input.lower() != "s":
         return
 
-    # ----- Cross-episode latency accumulator -----
+    # ----- Resolve and prepare output directory -----
+    output_dir = _resolve_output_dir(cfg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger_mp.info(f"Eval outputs will be written to: {output_dir}")
+
+    # ----- Resolve action-dim names (joint labels) from dataset metadata -----
+    action_dim = dataset.meta.features["action"]["shape"][0]
+    action_dim_names = _resolve_action_dim_names(dataset, action_dim)
+    logger_mp.info(f"Action dim names ({action_dim}): {action_dim_names}")
+
+    # ----- Cross-episode accumulators -----
     all_inference_times_ms: list[float] = []
+    per_episode_metrics: dict[int, dict] = {}
 
     # ===== Per-episode loop =====
     for ep_idx in cfg.episodes:
@@ -99,6 +173,10 @@ def eval_policy(
         # Clears the policy's internal chunk queue so each episode starts cold
         # (otherwise the first frame would pop a stale action from the previous episode).
         policy.reset()
+
+        # ----- Per-episode output directory -----
+        episode_dir = output_dir / "episodes" / f"episode_{ep_idx:03d}"
+        episode_dir.mkdir(parents=True, exist_ok=True)
 
         ground_truth_actions = []
         predicted_chunks = []
@@ -165,13 +243,13 @@ def eval_policy(
 
             ax.plot(ground_truth_actions[:, i], label="Ground Truth", color="blue")
             ax.plot(first_action_stream[:, i], label="Predicted (chunk[0])", color="red", linestyle="--")
-            ax.set_ylabel(f"Dim {i + 1}")
+            ax.set_ylabel(action_dim_names[i])
             ax.legend()
 
         axes[-1].set_xlabel("Timestep")
 
         plt.tight_layout()
-        plt.savefig(f"figure_episode_{ep_idx:03d}.png")
+        plt.savefig(episode_dir / "actions_trajectory.png")
         plt.close(fig)
 
         # ----- Per-episode horizon-decay plot -----
@@ -182,19 +260,46 @@ def eval_policy(
         ax.set_title(f"Horizon decay — Episode {ep_idx} (MSE of chunk[k] vs GT[t+k] across t)")
         ax.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig(f"horizon_decay_episode_{ep_idx:03d}.png")
+        plt.savefig(episode_dir / "horizon_decay.png")
         plt.close(fig)
 
         # ----- Persist raw arrays so any n_action_steps cadence can be derived offline -----
         np.savez_compressed(
-            f"predictions_episode_{ep_idx:03d}.npz",
+            episode_dir / "predictions.npz",
             chunks=predicted_chunks,
             ground_truth=ground_truth_actions,
             horizon_decay_mse=horizon_decay_mse,
         )
 
+        # ----- Per-episode core metrics -----
+        ep_metrics = _compute_episode_metrics(predicted_chunks, ground_truth_actions, horizon_decay_mse)
+        per_episode_metrics[ep_idx] = ep_metrics
+        mse_arr = np.array(ep_metrics["mse_per_dim"])
+        logger_mp.info(
+            f"Episode {ep_idx} metrics: mean_l2={ep_metrics['mean_l2']:.4f} | "
+            f"per-dim MSE min={mse_arr.min():.5f} max={mse_arr.max():.5f} mean={mse_arr.mean():.5f}"
+        )
+
     # ===== Cross-episode aggregate latency summary =====
     _log_inference_times("All episodes", all_inference_times_ms)
+
+    # ===== Cross-episode metrics aggregate + metrics.json dump =====
+    aggregate_metrics = _aggregate_metrics(per_episode_metrics)
+    if aggregate_metrics:
+        logger_mp.info(
+            f"All episodes mean_l2: {aggregate_metrics['mean_l2_mean']:.4f} ± {aggregate_metrics['mean_l2_std']:.4f} "
+            f"(n={aggregate_metrics['n_episodes']} episodes)"
+        )
+
+    metrics_payload = {
+        "action_dim_names": action_dim_names,
+        "episodes": {str(ep_idx): m for ep_idx, m in per_episode_metrics.items()},
+        "aggregate": aggregate_metrics,
+    }
+    metrics_path = output_dir / "metrics.json"
+    with open(metrics_path, "w") as f:
+        json.dump(metrics_payload, f, indent=2)
+    logger_mp.info(f"Metrics written to: {metrics_path}")
 
 
 @parser.wrap()

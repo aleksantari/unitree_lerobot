@@ -166,7 +166,7 @@ class EvalRealConfig:
 
     # Basic control parameters
     arm: str = "G1_29"  # G1_29, G1_23
-    ee: str = "dex3"  # dex3, dex1, inspire1, brainco
+    ee: str = "dex1"  # dex3, dex1, inspire1, brainco
 
     # Mode flags
     motion: bool = False
@@ -203,6 +203,7 @@ class OfflineEvalConfig:
 
     root: str = ""
     visualization: bool = False
+    output_dir: str | None = None
 
     rename_map: dict[str, str] = field(default_factory=dict)
 

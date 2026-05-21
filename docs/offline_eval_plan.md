@@ -43,8 +43,7 @@ class OfflineEvalConfig:
     repo_id: str                       # e.g. aleksantari/g1_dex1_tool_0_sorting
     episodes: list[int]                # required, explicit
     output_dir: str | None = None      # default: <ckpt_dir>/../../eval/<dataset_safe>/
-    modes: list[str] = field(default_factory=lambda: ["open_loop", "closed_loop"])
-    save_predictions: bool = True      # raw GT/pred arrays alongside plots
+    save_predictions: bool = True      # toggle for the per-episode .npz dump
     root: str | None = None            # passthrough to LeRobotDataset
 ```
 
@@ -109,53 +108,61 @@ Key behaviours:
 
 ## Metrics computed
 
-All metrics are **derived from the saved `predicted_chunks` array** (no parallel inference modes). Each metric below is a function of `predicted_chunks: (T, chunk_size, action_dim)` and `ground_truth_actions: (T, action_dim)`.
+All metrics are **derived from the saved `predicted_chunks` array** (no parallel inference modes). Each is a function of `predicted_chunks: (T, chunk_size, action_dim)` and `ground_truth_actions: (T, action_dim)`. The split below is in-script (canonical, every run) vs in-notebook (exploratory, per-experiment).
 
-**Already shipped:**
+**Shipped in-script (`metrics.json` + console log):**
 
 | Metric | Shape | Derivation |
 | --- | --- | --- |
-| `horizon_decay_mse` | `(chunk_size,)` | for each `k`: `mean_{valid t} MSE(predicted_chunks[t, k], ground_truth[t+k])` (positions past episode end are NaN). Saved into `predictions_episode_NNN.npz`. |
+| `mean_l2` (per ep) | scalar | mean L2 norm of `(predicted_chunks[:, 0, :] - ground_truth)` rows. The single-number episode score. |
+| `mse_per_dim` (per ep) | `(action_dim,)` | per-dim MSE between `predicted_chunks[:, 0, :]` and `ground_truth` |
+| `mae_per_dim` (per ep) | `(action_dim,)` | per-dim mean absolute error of same |
+| `horizon_decay_mse` (per ep) | `(chunk_size,)` | for each `k`: `mean_{valid t} MSE(predicted_chunks[t, k], ground_truth[t+k])` (positions past episode end are NaN). Also saved into `predictions.npz`. |
+| Aggregate `mean_l2_mean` / `mean_l2_std` | scalars | mean and std of per-episode `mean_l2` across all episodes |
+| Aggregate `mse_per_dim_mean` | `(action_dim,)` | mean of per-episode `mse_per_dim` across episodes |
+| Aggregate `horizon_decay_mse_mean` | `(chunk_size,)` | `nanmean` of per-episode `horizon_decay_mse` across episodes (short episodes leave trailing NaN, which nanmean ignores) |
 
-**To add in later increments (all derivable from the same `predicted_chunks`):**
+Headline numbers (`mean_l2` per episode + the aggregate mean ± std) are logged to the console at end-of-episode and end-of-run; full structure is dumped to `metrics.json` at the output dir root.
 
-| Metric | View | Derivation |
-| --- | --- | --- |
-| `mse_per_dim` (fresh) | open-loop | per-dim MSE between `predicted_chunks[:, 0, :]` and `ground_truth` |
-| `mae_per_dim` (fresh) | open-loop | per-dim mean absolute error of same |
-| `rmse_per_dim` (fresh) | open-loop | sqrt of mse |
-| `l2_per_step` (fresh) | open-loop | per-timestep L2 norm of `(predicted_chunks[:, 0, :] - ground_truth)` — drives error-over-time plot |
-| `mean_l2` (fresh) | open-loop | scalar; mean of `l2_per_step` |
-| `mse_per_dim` (deployed @k) | derived closed-loop | per-dim MSE between `predicted_chunks[(t // k) * k, t % k]` (for each t) and `ground_truth` — for any `k` |
-| Same metrics, deployed @k | derived closed-loop | same construction for any k ∈ [1, chunk_size] — no extra inference |
-| `closed_to_open_ratio` | comparison | `mean_l2_deployed_at_k / mean_l2_fresh` — quantifies the staleness penalty at any chosen k. ≥ 1.0 in healthy runs (staleness only hurts). |
+**To do in notebooks (exploratory, per-experiment — loads `.npz` files, no re-inference):**
 
-Aggregate across episodes (to land with `metrics.json` later):
+| View | Construction |
+| --- | --- |
+| Deployed-cadence sweep | for k in [1, chunk_size]: build `deployed = chunks[(t // k) * k, t % k] for t in range(T)`; compute mean_l2 vs k. Yields the curve that picks the right `n_action_steps` for deployment. |
+| `closed_to_open_ratio` at chosen k | `mean_l2_deployed_at_k / mean_l2_fresh` — quantifies the staleness penalty at any cadence. ≥ 1.0 in healthy runs. |
+| Per-task breakdown (combined-dataset GR00T) | split episodes by `task` string or source-of-origin offsets; aggregate metrics within each task |
+| Cross-checkpoint comparisons | load multiple `metrics.json` + `.npz` from different runs, contrast |
+| Failure-frame hunting | find the 10 frames with highest per-frame L2 error, plot the corresponding camera frames |
 
-- Mean and std of `mean_l2` across episodes (fresh + deployed-at-some-k)
-- Mean per-dim MSE/MAE/RMSE across episodes
-- Mean `horizon_decay_mse` across episodes — the cross-episode horizon curve
-- `comparison` block: ratios at the deployment k we settle on
+The dividing line: things you want to read on *every* eval go in-script; things that change per experiment or require interactive exploration go in a notebook. The script defines the stable schema; the notebook is where new analyses live until they prove worth promoting into the script.
 
-The key reframe vs prior versions of this doc: **the "open-loop vs closed-loop" duality is no longer two inference runs**, it's two views of the same saved tensor. The deployment cadence k can be chosen post-hoc, or swept post-hoc, without re-running inference.
+The key reframe vs prior versions of this doc: **the "open-loop vs closed-loop" duality is no longer two inference runs**, it's two views of the same saved tensor. The deployment cadence `k` can be chosen post-hoc, or swept post-hoc, without re-running inference.
 
 ## Output layout
 
+**Shipped** (default location is sibling to the policy checkpoint, override with `--output_dir=<path>`):
+
 ```
 outputs/train/<run>/eval/<dataset_safe_name>/
-├── metrics.json
-├── aggregate/
-│   ├── per_dim_error.png            # bar: per-dim MSE — open vs closed, episode error bars
-│   ├── horizon_decay.png            # line: mean error vs chunk-position k (open-loop)
-│   └── episode_summary.png          # bar: mean_l2 per episode, open vs closed
+├── metrics.json                     # per-episode + aggregate headline numbers
 └── episodes/
     └── episode_<NNN>/
-        ├── actions_trajectory.png   # action_dim subplots: GT vs open-loop-step0 vs closed-loop-deployed
-        ├── error_over_time.png      # L2 norm per timestep, open vs closed overlaid
-        └── predictions.npz          # gt, open_first_step, closed, open_chunks — for re-analysis
+        ├── actions_trajectory.png   # GT vs fresh-prediction stream (chunk[0])
+        ├── horizon_decay.png        # MSE of chunk[k] vs GT[t+k] across t
+        └── predictions.npz          # chunks, ground_truth, horizon_decay_mse
 ```
 
-`<dataset_safe_name>` = `repo_id.replace("/", "__")` for filesystem safety.
+**To add in later increments:**
+
+```
+outputs/train/<run>/eval/<dataset_safe_name>/
+└── aggregate/
+    ├── per_dim_error.png            # bar: per-dim MSE across episodes
+    ├── horizon_decay.png            # line: mean horizon decay across episodes
+    └── episode_summary.png          # bar: mean_l2 per episode
+```
+
+`<dataset_safe_name>` = `repo_id.replace("/", "__")` for filesystem safety. Resolution lives in `_resolve_output_dir(cfg)` in the script: honors `cfg.output_dir` if set, otherwise walks up from `cfg.policy.pretrained_path` to the run dir and appends `eval/<dataset_safe>`. Falls back to `./eval_outputs/<dataset_safe>` if the policy was trained from scratch (no pretrained path).
 
 ## Plotting
 
@@ -192,32 +199,41 @@ The previously-listed **per-bucket queue-pop vs forward-pass split** is now **ob
        --episodes "[0,10,20,30]"'
    ```
 
-   Expected on completion (in CWD; structured-dir layout is a later increment):
-   - `figure_episode_000.png` ... `figure_episode_030.png` — GT vs fresh-prediction stream.
-   - `horizon_decay_episode_000.png` ... `horizon_decay_episode_030.png` — curves rising left-to-right.
-   - `predictions_episode_000.npz` ... `predictions_episode_030.npz` — each carries `chunks`, `ground_truth`, `horizon_decay_mse`.
-   - Latency log lines per episode + aggregate, showing **unimodal stats** (mean ≈ p50 ≈ p95, `first` ≫ rest due to warm-up).
+   Expected on completion, under `outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/eval/aleksantari__g1_dex1_tool_0_sorting/`:
+   - `metrics.json` — per-episode + aggregate headline numbers
+   - `episodes/episode_000/actions_trajectory.png` ... `episodes/episode_030/actions_trajectory.png` — GT vs fresh-prediction stream
+   - `episodes/episode_000/horizon_decay.png` ... `episodes/episode_030/horizon_decay.png` — curves rising left-to-right
+   - `episodes/episode_000/predictions.npz` ... `episodes/episode_030/predictions.npz` — each carries `chunks`, `ground_truth`, `horizon_decay_mse`
+   - Latency log lines per episode + aggregate, showing **unimodal stats** (mean ≈ p50 ≈ p95, `first` ≫ rest due to warm-up)
+   - `Episode N metrics: mean_l2=... | per-dim MSE min=... max=... mean=...` lines per episode
+   - `All episodes mean_l2: X ± Y (n=4 episodes)` summary at the end
 
-2. Sanity-check a saved `.npz`:
+2. Sanity-check `metrics.json`:
+   - 4 entries under `episodes` (keys "0", "10", "20", "30")
+   - `aggregate.n_episodes == 4`
+   - `aggregate.mean_l2_mean` and `aggregate.mean_l2_std` are finite
+   - `aggregate.horizon_decay_mse_mean` is a list of length `chunk_size` with no nan at index 0 (every episode contributed `k=0`)
+
+3. Sanity-check a saved `.npz`:
 
    ```python
-   d = np.load("predictions_episode_000.npz")
+   d = np.load("episodes/episode_000/predictions.npz")
    d["chunks"].shape           # (T, chunk_size, action_dim) — e.g. (600, 100, 16) for ACT
    d["ground_truth"].shape     # (T, action_dim)
    d["horizon_decay_mse"]      # (chunk_size,)
    d["horizon_decay_mse"][0] < d["horizon_decay_mse"][-1]   # True — error grows with horizon
    ```
 
-3. **Post-processing smoke test** (the design's core payoff): from a saved `.npz`, derive what `n_action_steps=100` would have deployed and confirm it matches the prior `select_action`-based eval — without any new inference.
+4. **Post-processing smoke test** (the design's core payoff): from a saved `.npz`, derive what `n_action_steps=100` would have deployed — without any new inference.
 
    ```python
    k = 100
    deployed = np.array([d["chunks"][(t // k) * k, t % k] for t in range(len(d["ground_truth"]))])
    ```
 
-4. Spot-check `horizon_decay_episode_NNN.png` — should rise from near-zero at `k=0` (fresh-prediction quality) to larger at `k=chunk_size-1`. If it's flat, suspect indexing bugs in the `t+k` truncation.
+5. Spot-check `episodes/episode_000/horizon_decay.png` — should rise from near-zero at `k=0` (fresh-prediction quality) to larger at `k=chunk_size-1`. If it's flat, suspect indexing bugs in the `t+k` truncation.
 
-5. Spot-check `figure_episode_000.png` — dominant arm dims should track GT closely on the fresh-prediction trace. The fresh-prediction stream should be at least as accurate as the prior `select_action`-based plot since it has no staleness.
+6. Spot-check `episodes/episode_000/actions_trajectory.png` — dominant arm dims should track GT closely on the fresh-prediction trace. The fresh-prediction stream should be at least as accurate as a `select_action`-based equivalent since it has no staleness.
 
 ## GR00T extension (deferred)
 

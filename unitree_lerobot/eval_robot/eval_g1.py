@@ -71,8 +71,12 @@ def eval_policy(
     image_info = None
     try:
         # --- Setup Phase ---
+        logger_mp.info("Setting up image client...")
         image_info = setup_image_client(cfg)
+        logger_mp.info("Image client ready.")
+        logger_mp.info("Setting up robot interface...")
         robot_interface = setup_robot_interface(cfg)
+        logger_mp.info("Robot interface ready.")
 
         # Unpack interfaces for convenience
         arm_ctrl, arm_ik, ee_shared_mem, arm_dof, ee_dof = (
@@ -97,8 +101,11 @@ def eval_policy(
 
         user_input = input("Enter 's' to initialize the robot and start the evaluation: ")
         idx = 0
+
         print(f"user_input: {user_input}")
+
         full_state = None
+
         if user_input.lower() == "s":
             # "The initial positions of the robot's arm and fingers take the initial positions during data recording."
             logger_mp.info("Initializing robot to starting pose...")
@@ -111,9 +118,16 @@ def eval_policy(
                 loop_start_time = time.perf_counter()
                 # 1. Get Observations
                 observation, current_arm_q = process_images_and_observations(
-                    tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam, arm_ctrl
+                    tv_img_array, 
+                    wrist_img_array, 
+                    tv_img_shape, 
+                    wrist_img_shape, 
+                    is_binocular, 
+                    has_wrist_cam, 
+                    arm_ctrl
                 )
                 left_ee_state = right_ee_state = np.array([])
+                
                 if cfg.ee:
                     with ee_shared_mem["lock"]:
                         full_state = np.array(ee_shared_mem["state"][:])

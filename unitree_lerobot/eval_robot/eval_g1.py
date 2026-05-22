@@ -7,8 +7,10 @@ Refer to:   lerobot/lerobot/scripts/eval.py
 import time
 import torch
 import logging
+import cv2
 
 import numpy as np
+from pathlib import Path
 from pprint import pformat
 from dataclasses import asdict
 from torch import nn
@@ -80,6 +82,31 @@ def eval_policy(
         arm_ctrl, arm_ik, ee_shared_mem, arm_dof, ee_dof = (
             robot_interface[key] for key in ["arm_ctrl", "arm_ik", "ee_shared_mem", "arm_dof", "ee_dof"]
         )
+
+        # --- Cam check mode: pull one observation, save the four images, log shapes, exit.
+        # Enable with --cam_check_only=true. Does NOT command any robot motion.
+        # Verifies the head-camera binocular split + resize and confirms wrist feeds.
+        if cfg.cam_check_only:
+            out_dir = Path("cam_dryrun")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            logger_mp.info(f"--cam_check_only: pulling one observation, saving to {out_dir.resolve()}")
+
+            obs, arm_q = process_images_and_observations(image_client, image_config, arm_ctrl)
+            for key, tensor in obs.items():
+                if not key.startswith("observation.images."):
+                    continue
+                cam_name = key.removeprefix("observation.images.")
+                if tensor is None:
+                    logger_mp.warning(f"  {cam_name}: None (no frame received)")
+                    continue
+                # `to_tensor_rgb` produced an HWC RGB uint8 tensor; cv2.imwrite needs BGR.
+                arr = tensor.numpy() if hasattr(tensor, "numpy") else tensor
+                logger_mp.info(f"  {cam_name}: shape={tuple(arr.shape)} dtype={arr.dtype}")
+                bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(out_dir / f"{cam_name}.png"), bgr)
+            logger_mp.info(f"  current_arm_q: {None if arm_q is None else tuple(arm_q.shape)}")
+            logger_mp.info("Camera check complete. Exiting before robot motion.")
+            return
 
         # Get initial pose from the first step of the dataset
         from_idx = dataset.meta.episodes["dataset_from_index"][0]

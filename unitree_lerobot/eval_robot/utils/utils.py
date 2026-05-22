@@ -185,6 +185,7 @@ class EvalRealConfig:
     motion: bool = False
     headless: bool = False
     visualization: bool = False
+    cam_check_only: bool = False  # If True, pull one observation, save the four camera frames to ./cam_dryrun/, log shapes, and exit without sending any motion command.
     send_real_robot: bool = False
     use_dataset: bool = False
 

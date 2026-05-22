@@ -156,3 +156,21 @@ tmux attach -t train_act          # ACT training
 tmux attach -t convert_sorting    # tool_0_sorting conversion
 tmux attach -t convert_handover   # tool_0_handover conversion
 tmux ls                           # list all sessions
+
+
+
+
+# this is the image server
+ssh unitree@192.168.123.164
+123
+cd teleimager 
+ZED_Explorer -a
+python -m teleimager.image_server
+
+# if want to use neck joint
+# python neck_server.py --bind 0.0.0.0:5555
+
+# check the image connection
+conda activate tv
+cd teleimager/src/teleimager
+python image_client.py

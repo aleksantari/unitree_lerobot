@@ -17,6 +17,28 @@ logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
 
+# Real-time budget shared across offline (eval_g1_dataset.py) and on-robot (eval_g1.py) evals.
+# 30 Hz target matches the data collection cadence and the default cfg.frequency.
+_REALTIME_BUDGET_HZ = 30.0
+_REALTIME_BUDGET_MS = 1000.0 / _REALTIME_BUDGET_HZ
+
+
+def log_inference_times(label: str, times_ms: list[float]) -> None:
+    if not times_ms:
+        return
+    arr = np.array(times_ms)
+    budget_ok = arr.max() < _REALTIME_BUDGET_MS
+    logger_mp.info(
+        f"{label} inference (ms): "
+        f"mean={arr.mean():.2f} std={arr.std():.2f} "
+        f"min={arr.min():.2f} max={arr.max():.2f} "
+        f"p50={np.percentile(arr, 50):.2f} p95={np.percentile(arr, 95):.2f} p99={np.percentile(arr, 99):.2f} "
+        f"| n={len(arr)} | first={arr[0]:.2f} (incl. warm-up) "
+        f"| {_REALTIME_BUDGET_HZ:.0f}Hz budget ({_REALTIME_BUDGET_MS:.2f}ms): "
+        f"{'OK' if budget_ok else 'BUSTED'}"
+    )
+
+
 def extract_observation(step: dict):
     observation = {}
 
@@ -186,7 +208,11 @@ class EvalRealConfig:
     headless: bool = False
     visualization: bool = False
     cam_check_only: bool = False  # If True, pull one observation, save the four camera frames to ./cam_dryrun/, log shapes, and exit without sending any motion command.
-    send_real_robot: bool = False
+    # Stage gates for eval_g1.py — both default off so an accidental launch never commands motion.
+    soft_start: bool = False  # Stage 1: linearly interpolate the arms from the current pose to init_arm_pose before the policy loop.
+    run_policy: bool = False  # Stage 2: run the inference loop (sends actions to arms + EE). Assumes the robot is already at init_arm_pose unless soft_start is also set.
+    max_steps: int = 0  # Cap on policy loop iterations; 0 means unlimited (original while-True behavior).
+    send_real_robot: bool = False  # Legacy; eval_g1.py no longer references this. Kept for dataclass-import compatibility.
     use_dataset: bool = False
 
     rename_map: dict[str, str] = field(default_factory=dict)

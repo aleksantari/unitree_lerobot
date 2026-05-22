@@ -36,6 +36,7 @@ from unitree_lerobot.eval_robot.make_robot import (
     process_images_and_observations,
 )
 from unitree_lerobot.eval_robot.utils.utils import (
+    log_inference_times,
     predict_action,
     to_list,
     to_scalar,
@@ -47,6 +48,12 @@ import logging_mp
 
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
+
+# Per-frame arm-joint delta cap for the policy loop.
+# 0.15 rad ≈ 8.6° per frame; at 30 Hz that's ~4.5 rad/s peak joint velocity --
+# ~2× headroom over fast-but-normal teleop (typically peaks at 2-3 rad/s = ~0.07 rad/frame).
+# A misfiring policy that spikes a joint by 0.5+ rad in one frame trips this and the loop aborts.
+_MAX_ARM_DELTA_PER_FRAME = 0.15
 
 
 def eval_policy(
@@ -109,78 +116,148 @@ def eval_policy(
             return
 
         # Get initial pose from the first step of the dataset
-        from_idx = dataset.meta.episodes["dataset_from_index"][0]
+        from_idx = dataset.meta.episodes["dataset_from_index"][1]
         step = dataset[from_idx]
         init_arm_pose = step["observation.state"][:arm_dof].cpu().numpy()
 
-        user_input = input("Enter 's' to initialize the robot and start the evaluation: ")
+        logger_mp.info(f"Stages: soft_start={cfg.soft_start}, run_policy={cfg.run_policy}")
+        if not cfg.soft_start and not cfg.run_policy:
+            logger_mp.info("No stage flags set; nothing to do. Pass --soft_start=true and/or --run_policy=true.")
+            return
+
+        user_input = input("Enter 's' to begin (Ctrl+C to abort safely): ")
+        if user_input.lower() != "s":
+            logger_mp.info("Aborted by user before any motion.")
+            return
+
+        # --- Stage 1: soft-start (linear interpolation from current arm pose to init_arm_pose) ---
+        # Gets the robot from arms-down (OOD for the policy) into the dataset's start pose so the
+        # policy loop receives in-distribution observations. Per-step delta is bounded by
+        # |target - current| / n_steps -- typically a fraction of a degree per step over 3 seconds.
+        if cfg.soft_start:
+            current_q = arm_ctrl.get_current_dual_arm_q()
+            target_q = init_arm_pose
+            soft_start_duration_s = 3.0
+            n_steps = max(1, int(soft_start_duration_s * cfg.frequency))
+            logger_mp.info(
+                f"Soft-start: interpolating to init_arm_pose over {soft_start_duration_s:.1f}s "
+                f"({n_steps} steps at {cfg.frequency} Hz)."
+            )
+            logger_mp.info(f"  current: {np.array2string(np.asarray(current_q), precision=3, suppress_small=True)}")
+            logger_mp.info(f"  target:  {np.array2string(np.asarray(target_q),  precision=3, suppress_small=True)}")
+            # Log per-joint delta so a human can eyeball the move before any motor command. The
+            # per-step delta is delta/n_steps -- tiny by construction unless one of these vectors is bad.
+            delta_q = np.asarray(target_q) - np.asarray(current_q)
+            logger_mp.info(f"  delta:   {np.array2string(delta_q, precision=3, suppress_small=True)}")
+            if not np.all(np.isfinite(current_q)) or not np.all(np.isfinite(target_q)):
+                logger_mp.error("Non-finite values in current_q or target_q; aborting soft-start before motion.")
+                return
+            for i in range(1, n_steps + 1):
+                alpha = i / n_steps
+                q_step = (1.0 - alpha) * current_q + alpha * target_q
+                tau = arm_ik.solve_tau(q_step)
+                arm_ctrl.ctrl_dual_arm(q_step, tau)
+                time.sleep(1.0 / cfg.frequency)
+            time.sleep(0.5)  # brief settle before reading state in the policy loop
+            logger_mp.info("Soft-start complete; robot at init_arm_pose.")
+
+        # --- Stage 2: policy loop ---
+        if not cfg.run_policy:
+            logger_mp.info("run_policy=false: skipping inference loop.")
+            return
+
+        logger_mp.info(
+            f"Starting policy loop at {cfg.frequency} Hz "
+            f"(max_steps={'unlimited' if cfg.max_steps == 0 else cfg.max_steps})."
+        )
         idx = 0
-
-        print(f"user_input: {user_input}")
-
+        inference_times_ms: list[float] = []
         full_state = None
+        # Seed the per-frame delta guard with the robot's *actual* current pose so the first frame's
+        # check catches "the policy's first command is far from where the robot is right now."
+        last_arm_action = np.asarray(arm_ctrl.get_current_dual_arm_q()).copy()
+        logger_mp.info(f"Per-frame arm-delta cap: {_MAX_ARM_DELTA_PER_FRAME} rad (~{np.degrees(_MAX_ARM_DELTA_PER_FRAME):.1f}° per frame at {cfg.frequency} Hz).")
+        while cfg.max_steps == 0 or idx < cfg.max_steps:
+            loop_start_time = time.perf_counter()
+            # 1. Get Observations
+            observation, current_arm_q = process_images_and_observations(
+                image_client, image_config, arm_ctrl
+            )
+            left_ee_state = right_ee_state = np.array([])
 
-        if user_input.lower() == "s":
-            # "The initial positions of the robot's arm and fingers take the initial positions during data recording."
-            logger_mp.info("Initializing robot to starting pose...")
-            tau = robot_interface["arm_ik"].solve_tau(init_arm_pose)
-            robot_interface["arm_ctrl"].ctrl_dual_arm(init_arm_pose, tau)
-            time.sleep(1.0)  # Give time for the robot to move
-            # --- Run Main Loop ---
-            logger_mp.info(f"Starting evaluation loop at {cfg.frequency} Hz.")
-            while True:
-                loop_start_time = time.perf_counter()
-                # 1. Get Observations
-                observation, current_arm_q = process_images_and_observations(
-                    image_client, image_config, arm_ctrl
+            if cfg.ee:
+                with ee_shared_mem["lock"]:
+                    full_state = np.array(ee_shared_mem["state"][:])
+                    left_ee_state = full_state[:ee_dof]
+                    right_ee_state = full_state[ee_dof:]
+            state_tensor = torch.from_numpy(
+                np.concatenate((current_arm_q, left_ee_state, right_ee_state), axis=0)
+            ).float()
+            observation["observation.state"] = state_tensor
+
+            # 2. Get Action from Policy (timed for the budget check at end of loop)
+            infer_start = time.perf_counter()
+            action = predict_action(
+                observation,
+                policy,
+                get_safe_torch_device(policy.config.device),
+                preprocessor,
+                postprocessor,
+                policy.config.use_amp,
+                step["task"],
+                use_dataset=cfg.use_dataset,
+                robot_type=None,
+            )
+            inference_times_ms.append((time.perf_counter() - infer_start) * 1000.0)
+            action_np = action.cpu().numpy()
+
+            # NaN / inf guard -- fail fast rather than forward garbage to the motors.
+            if not np.all(np.isfinite(action_np)):
+                logger_mp.error(f"Non-finite values in policy action: {action_np}. Aborting loop.")
+                break
+
+            # 3. Execute Action
+            arm_action = action_np[:arm_dof]
+
+            # Per-frame arm-joint delta guard. Compare to the previous commanded arm pose; if any
+            # single arm joint would jump by more than _MAX_ARM_DELTA_PER_FRAME radians in one
+            # frame, that's outside the bounds of plausible normal motion -- abort and inspect.
+            # Gripper dims (action_np[arm_dof:]) are excluded by construction.
+            arm_delta = arm_action - last_arm_action
+            max_abs_delta = float(np.max(np.abs(arm_delta)))
+            if max_abs_delta > _MAX_ARM_DELTA_PER_FRAME:
+                worst_joint = int(np.argmax(np.abs(arm_delta)))
+                logger_mp.error(
+                    f"Large arm-joint delta at step {idx}: "
+                    f"joint[{worst_joint}] changed by {arm_delta[worst_joint]:+.4f} rad "
+                    f"(|max|={max_abs_delta:.4f} > cap {_MAX_ARM_DELTA_PER_FRAME}). Aborting loop."
                 )
-                left_ee_state = right_ee_state = np.array([])
+                break
 
-                if cfg.ee:
-                    with ee_shared_mem["lock"]:
-                        full_state = np.array(ee_shared_mem["state"][:])
-                        left_ee_state = full_state[:ee_dof]
-                        right_ee_state = full_state[ee_dof:]
-                state_tensor = torch.from_numpy(
-                    np.concatenate((current_arm_q, left_ee_state, right_ee_state), axis=0)
-                ).float()
-                observation["observation.state"] = state_tensor
-                # 2. Get Action from Policy
-                action = predict_action(
-                    observation,
-                    policy,
-                    get_safe_torch_device(policy.config.device),
-                    preprocessor,
-                    postprocessor,
-                    policy.config.use_amp,
-                    step["task"],
-                    use_dataset=cfg.use_dataset,
-                    robot_type=None,
-                )
-                action_np = action.cpu().numpy()
-                # 3. Execute Action
-                arm_action = action_np[:arm_dof]
-                tau = arm_ik.solve_tau(arm_action)
-                arm_ctrl.ctrl_dual_arm(arm_action, tau)
+            tau = arm_ik.solve_tau(arm_action)
+            arm_ctrl.ctrl_dual_arm(arm_action, tau)
+            last_arm_action = arm_action.copy()
 
-                if cfg.ee:
-                    ee_action_start_idx = arm_dof
-                    left_ee_action = action_np[ee_action_start_idx : ee_action_start_idx + ee_dof]
-                    right_ee_action = action_np[ee_action_start_idx + ee_dof : ee_action_start_idx + 2 * ee_dof]
-                    # logger_mp.info(f"EE Action: left {left_ee_action}, right {right_ee_action}")
+            if cfg.ee:
+                ee_action_start_idx = arm_dof
+                left_ee_action = action_np[ee_action_start_idx : ee_action_start_idx + ee_dof]
+                right_ee_action = action_np[ee_action_start_idx + ee_dof : ee_action_start_idx + 2 * ee_dof]
 
-                    if isinstance(ee_shared_mem["left"], SynchronizedArray):
-                        ee_shared_mem["left"][:] = to_list(left_ee_action)
-                        ee_shared_mem["right"][:] = to_list(right_ee_action)
-                    elif hasattr(ee_shared_mem["left"], "value") and hasattr(ee_shared_mem["right"], "value"):
-                        ee_shared_mem["left"].value = to_scalar(left_ee_action)
-                        ee_shared_mem["right"].value = to_scalar(right_ee_action)
+                if isinstance(ee_shared_mem["left"], SynchronizedArray):
+                    ee_shared_mem["left"][:] = to_list(left_ee_action)
+                    ee_shared_mem["right"][:] = to_list(right_ee_action)
+                elif hasattr(ee_shared_mem["left"], "value") and hasattr(ee_shared_mem["right"], "value"):
+                    ee_shared_mem["left"].value = to_scalar(left_ee_action)
+                    ee_shared_mem["right"].value = to_scalar(right_ee_action)
 
-                if cfg.visualization:
-                    visualization_data(idx, observation, state_tensor.numpy(), action_np, rerun_logger)
-                idx += 1
-                # Maintain frequency
-                time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
+            if cfg.visualization:
+                visualization_data(idx, observation, state_tensor.numpy(), action_np, rerun_logger)
+            idx += 1
+            # Maintain frequency
+            time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
+
+        logger_mp.info(f"Policy loop completed after {idx} steps.")
+        log_inference_times("Real-robot run", inference_times_ms)
     except Exception as e:
         logger_mp.info(f"An error occurred: {e}")
     finally:

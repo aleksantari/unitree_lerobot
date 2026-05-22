@@ -33,6 +33,7 @@ from lerobot.processor import (
 
 from unitree_lerobot.eval_robot.utils.utils import (
     extract_observation,
+    log_inference_times,
     predict_chunk,
     OfflineEvalConfig,
 )
@@ -43,25 +44,6 @@ import logging_mp
 
 logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
-
-_REALTIME_BUDGET_HZ = 30.0
-_REALTIME_BUDGET_MS = 1000.0 / _REALTIME_BUDGET_HZ
-
-
-def _log_inference_times(label: str, times_ms: list[float]) -> None:
-    if not times_ms:
-        return
-    arr = np.array(times_ms)
-    budget_ok = arr.max() < _REALTIME_BUDGET_MS
-    logger_mp.info(
-        f"{label} inference (ms): "
-        f"mean={arr.mean():.2f} std={arr.std():.2f} "
-        f"min={arr.min():.2f} max={arr.max():.2f} "
-        f"p50={np.percentile(arr, 50):.2f} p95={np.percentile(arr, 95):.2f} p99={np.percentile(arr, 99):.2f} "
-        f"| n={len(arr)} | first={arr[0]:.2f} (incl. warm-up) "
-        f"| {_REALTIME_BUDGET_HZ:.0f}Hz budget ({_REALTIME_BUDGET_MS:.2f}ms): "
-        f"{'OK' if budget_ok else 'BUSTED'}"
-    )
 
 
 def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
@@ -230,7 +212,7 @@ def eval_policy(
                 visualization_data(step_idx, observation, observation["observation.state"], chunk_np[0], rerun_logger)
 
         # ----- Per-episode latency summary -----
-        _log_inference_times(f"Episode {ep_idx}", inference_times_ms)
+        log_inference_times(f"Episode {ep_idx}", inference_times_ms)
         all_inference_times_ms.extend(inference_times_ms)
 
         # ----- Stack and derive analysis arrays -----
@@ -301,7 +283,7 @@ def eval_policy(
         )
 
     # ===== Cross-episode aggregate latency summary =====
-    _log_inference_times("All episodes", all_inference_times_ms)
+    log_inference_times("All episodes", all_inference_times_ms)
 
     # ===== Cross-episode metrics aggregate + metrics.json dump =====
     aggregate_metrics = _aggregate_metrics(per_episode_metrics)

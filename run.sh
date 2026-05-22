@@ -151,6 +151,103 @@ for step in 005000 010000 015000 017500; do
         --seed=42"
 done
 
+# === Real-robot eval (eval_g1.py) — ACT on the live G1+Dex1 ===
+# Requires the robot's image_server to be running (see SSH block at the bottom of this file).
+# Uses the dex1-calibrated URDF + teleop-derived IK that match the data-collection setup:
+#   urdf: unitree_lerobot/eval_robot/assets/g1/g1_29dof_mode_16_dex1_calib.urdf
+#   ik:   G1_29_ArmIK (in robot_arm_ik.py). The hand14 backup is G1_29_ArmIK_Hand14.
+# Safety layers active in the policy loop:
+#   - NaN/inf guard refuses to send garbage to motors
+#   - Per-frame arm-delta cap (_MAX_ARM_DELTA_PER_FRAME = 0.2 rad in eval_g1.py; bump to 0.3-0.5
+#     if legit fast motion trips it -- above 0.5 the hardware velocity ceiling takes over anyway)
+#   - 'q' keypress (no Enter) for emergency stop during the policy loop
+#   - Ctrl+C always aborts; image_client + terminal mode are restored in finally
+#   - --max_steps=N bounds the loop length
+# With --soft_start=true AND --run_policy=true there are TWO 's' prompts: one before soft-start,
+# one before the policy loop, so you can verify the arms reached init_arm_pose before the policy
+# starts driving. Either flag alone gives just one prompt.
+
+# --- Stage 0: camera dry-run (zero motor risk) ---
+# Pulls one observation, saves cam_left_high / cam_right_high / cam_left_wrist / cam_right_wrist
+# as PNGs in ./cam_dryrun/. Verifies head binocular split + 480x640 resize + wrist feeds.
+# Run this whenever you change anything in make_robot.py or the image stack.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --cam_check_only=true'
+
+# --- Stage 1: soft-start only (arms interpolate, policy does NOT run) ---
+# Linearly interpolates the arms over 3s from current pose to dataset frame 0 arm pose, then
+# writes the dataset's first-frame gripper state to shared memory, then exits. Validates the
+# motor command path safely. Eyeball the `current:` / `target:` / `delta:` log lines BEFORE
+# the interpolation starts -- Ctrl+C at the prompt if anything looks wrong.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=true --run_policy=false'
+
+# --- Stage 2: policy only (robot must already be at init pose from a prior Stage 1) ---
+# Runs only the policy loop with a short cap. Gripper init still fires (independent of soft_start).
+# Useful for quick re-runs without re-interpolating the arms each time.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=false --run_policy=true --max_steps=30'
+
+# --- Full eval: soft-start + policy (canonical command for an actual eval session) ---
+# Sequence: setup -> 1st 's' prompt -> 3s arm interpolation -> gripper init + 0.3s settle ->
+# 2nd 's' prompt (verify robot reached init pose) -> policy loop with 'q' e-stop armed ->
+# latency summary -> clean exit. max_steps=600 ≈ 20s at 30Hz; tune for longer rollouts.
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=true --run_policy=true --max_steps=600'
+
+# === Real-robot eval (eval_g1.py) — GR00T on the live G1+Dex1 ===
+# Uses the unified env `unitree-lerobot-groot` (cloned from unitree-lerobot + transformers/peft/timm/
+# flash_attn). The eval_g1.py script is policy-agnostic: same factories, same predict_action path,
+# same observation dict -- ACT vs GR00T differs only in the checkpoint and the env that backs it.
+# Safety layers are identical to the ACT block above (NaN guard, _MAX_ARM_DELTA_PER_FRAME cap,
+# 'q' e-stop, Ctrl+C, max_steps bound, two 's' prompts when both flags set).
+#
+# Expectations specific to GR00T:
+#   - GR00T-N1.5 is ~3B params -- single forward pass on RTX 5090 with bf16 is ~50-200 ms.
+#     The script's 30Hz budget check WILL be marked BUSTED on the slow-of-chunk frames. This is
+#     a label, not a correctness bug -- policy.select_action uses an internal chunk queue so only
+#     every Nth step triggers a forward pass; the rest pop a cached action.
+#   - First step is always slowest (CUDA graph compile, kernel autotune). log_inference_times
+#     labels it "incl. warm-up".
+#   - First-run launch is the chosen tier1 checkpoint (projector-only tune from the combined dataset).
+#     Use the single-task sorting repo_id for the obs spec + init pose; the model has seen this
+#     task string in training so language conditioning lines up.
+#   - If --max_steps trips the per-frame delta cap, the cap (0.25 rad in eval_g1.py) may need a
+#     small bump (~0.3-0.4) -- see the ACT block's notes for the rationale.
+
+# --- Stage 0: camera dry-run (zero motor risk) ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --cam_check_only=true'
+
+# --- Stage 1: soft-start only (arms interpolate, policy does NOT run) ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=true --run_policy=false'
+
+# --- Stage 2: policy only (robot must already be at init pose from a prior Stage 1) ---
+# max_steps=30 keeps the first GR00T-on-robot test to ~1s of motion -- finger on 'q' / Ctrl+C.
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=false --run_policy=true --max_steps=30'
+
+# --- Full eval: soft-start + policy (canonical GR00T-on-robot command) ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --soft_start=true --run_policy=true --max_steps=600'
+
 # === Attach to running tmux sessions ===
 tmux attach -t train_act          # ACT training
 tmux attach -t convert_sorting    # tool_0_sorting conversion

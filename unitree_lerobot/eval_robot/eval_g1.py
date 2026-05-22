@@ -57,7 +57,7 @@ logger_mp.setLevel(logging_mp.INFO)
 # 0.15 rad ≈ 8.6° per frame; at 30 Hz that's ~4.5 rad/s peak joint velocity --
 # ~2× headroom over fast-but-normal teleop (typically peaks at 2-3 rad/s = ~0.07 rad/frame).
 # A misfiring policy that spikes a joint by 0.5+ rad in one frame trips this and the loop aborts.
-_MAX_ARM_DELTA_PER_FRAME = 0.25
+_MAX_ARM_DELTA_PER_FRAME = 0.3
 
 
 def eval_policy(

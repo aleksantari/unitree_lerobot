@@ -174,6 +174,9 @@ class EvalRealConfig:
     episodes: int = 0
     frequency: float = 30.0
 
+    # Network / image client
+    image_host: str = "192.168.123.164"  # IP of the robot's image_server (ZMQ host)
+
     # Basic control parameters
     arm: str = "G1_29"  # G1_29, G1_23
     ee: str = "dex1"  # dex3, dex1, inspire1, brainco

@@ -34,7 +34,6 @@ from unitree_lerobot.eval_robot.make_robot import (
     process_images_and_observations,
 )
 from unitree_lerobot.eval_robot.utils.utils import (
-    cleanup_resources,
     predict_action,
     to_list,
     to_scalar,
@@ -68,32 +67,18 @@ def eval_policy(
         preprocessor.reset()
         postprocessor.reset()
 
-    image_info = None
     try:
         # --- Setup Phase ---
         logger_mp.info("Setting up image client...")
-        image_info = setup_image_client(cfg)
+        image_client, image_config = setup_image_client(cfg)
         logger_mp.info("Image client ready.")
         logger_mp.info("Setting up robot interface...")
         robot_interface = setup_robot_interface(cfg)
         logger_mp.info("Robot interface ready.")
 
         # --- Unpack interfaces for convenience ---
-        # robot_interface
         arm_ctrl, arm_ik, ee_shared_mem, arm_dof, ee_dof = (
             robot_interface[key] for key in ["arm_ctrl", "arm_ik", "ee_shared_mem", "arm_dof", "ee_dof"]
-        )
-        # image_info
-        tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam = (
-            image_info[key]
-            for key in [
-                "tv_img_array",
-                "wrist_img_array",
-                "tv_img_shape",
-                "wrist_img_shape",
-                "is_binocular",
-                "has_wrist_cam",
-            ]
         )
 
         # Get initial pose from the first step of the dataset
@@ -120,7 +105,7 @@ def eval_policy(
                 loop_start_time = time.perf_counter()
                 # 1. Get Observations
                 observation, current_arm_q = process_images_and_observations(
-                    tv_img_array, wrist_img_array, tv_img_shape, wrist_img_shape, is_binocular, has_wrist_cam, arm_ctrl
+                    image_client, image_config, arm_ctrl
                 )
                 left_ee_state = right_ee_state = np.array([])
 
@@ -172,8 +157,12 @@ def eval_policy(
     except Exception as e:
         logger_mp.info(f"An error occurred: {e}")
     finally:
-        if image_info:
-            cleanup_resources(image_info)
+        # Guard with locals() in case setup failed before image_client was assigned.
+        if "image_client" in locals():
+            try:
+                image_client.close()
+            except Exception as close_err:
+                logger_mp.warning(f"Failed to close image_client cleanly: {close_err}")
 
 
 @parser.wrap()

@@ -70,7 +70,7 @@ EE_CONFIG: dict[str, dict[str, Any]] = {
 }
 
 
-def setup_image_client(args: argparse.Namespace) -> dict[str, Any]:
+def setup_image_client(args: argparse.Namespace) -> tuple[ImageClient, dict[str, Any]]:
     """Initializes and starts the image client and shared memory."""
     # image client: img_config should be the same as the configuration in image_server.py (of Robot's development computing unit)
 
@@ -186,7 +186,9 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
 
         if camera_config["head_camera"]["enable_zmq"]:
             head_img = img_client.get_head_frame()
-            if head_img is not None:
+            # `head_img` is always a TeleImage object; the decoded `.bgr` is what may be None
+            # (no frame yet, poll timeout, or decode failure). Slicing None would TypeError.
+            if head_img.bgr is not None:
                 observation["observation.images.cam_left_high"] = to_tensor_rgb(
                     head_img.bgr[:, : camera_config["head_camera"]["image_shape"][1] // 2]
                 )
@@ -194,20 +196,20 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
                     head_img.bgr[:, camera_config["head_camera"]["image_shape"][1] // 2 :]
                 )
             else:
-                logger_mp.warning("Head image is None!")
+                logger_mp.warning("Head image bgr is None!")
 
         if camera_config["left_wrist_camera"]["enable_zmq"]:
             left_wrist = img_client.get_left_wrist_frame()
-            if left_wrist is not None:
+            if left_wrist.bgr is not None:
                 observation["observation.images.cam_left_wrist"] = to_tensor_rgb(left_wrist.bgr)
             else:
-                logger_mp.warning("left_wrist image is None!")
+                logger_mp.warning("left_wrist image bgr is None!")
         if camera_config["right_wrist_camera"]["enable_zmq"]:
             right_wrist = img_client.get_right_wrist_frame()
-            if right_wrist is not None:
+            if right_wrist.bgr is not None:
                 observation["observation.images.cam_right_wrist"] = to_tensor_rgb(right_wrist.bgr)
             else:
-                logger_mp.warning("right_wrist image is None!")
+                logger_mp.warning("right_wrist image bgr is None!")
 
         status["image_ok"] = True
 

@@ -189,12 +189,19 @@ def process_images_and_observations(img_client, camera_config, arm_ctrl):
             # `head_img` is always a TeleImage object; the decoded `.bgr` is what may be None
             # (no frame yet, poll timeout, or decode failure). Slicing None would TypeError.
             if head_img.bgr is not None:
-                observation["observation.images.cam_left_high"] = to_tensor_rgb(
-                    head_img.bgr[:, : camera_config["head_camera"]["image_shape"][1] // 2]
-                )
-                observation["observation.images.cam_right_high"] = to_tensor_rgb(
-                    head_img.bgr[:, camera_config["head_camera"]["image_shape"][1] // 2 :]
-                )
+                # ZED stereo camera publishes the binocular pair stitched side-by-side.
+                # Split using the actual frame width — the cam_config's image_shape can
+                # describe per-eye dimensions rather than the stitched shape, so the
+                # array's own width is the more reliable source of truth.
+                mid = head_img.bgr.shape[1] // 2
+                left_half = head_img.bgr[:, :mid]
+                right_half = head_img.bgr[:, mid:]
+                # Resize to (height=480, width=640) — same operation the dataset converter
+                # applies, so the live observation matches the training distribution.
+                left_resized = cv2.resize(left_half, (640, 480), interpolation=cv2.INTER_AREA)
+                right_resized = cv2.resize(right_half, (640, 480), interpolation=cv2.INTER_AREA)
+                observation["observation.images.cam_left_high"] = to_tensor_rgb(left_resized)
+                observation["observation.images.cam_right_high"] = to_tensor_rgb(right_resized)
             else:
                 logger_mp.warning("Head image bgr is None!")
 

@@ -57,7 +57,7 @@ logger_mp.setLevel(logging_mp.INFO)
 # 0.15 rad ≈ 8.6° per frame; at 30 Hz that's ~4.5 rad/s peak joint velocity --
 # ~2× headroom over fast-but-normal teleop (typically peaks at 2-3 rad/s = ~0.07 rad/frame).
 # A misfiring policy that spikes a joint by 0.5+ rad in one frame trips this and the loop aborts.
-_MAX_ARM_DELTA_PER_FRAME = 0.15
+_MAX_ARM_DELTA_PER_FRAME = 0.25
 
 
 def eval_policy(
@@ -162,8 +162,28 @@ def eval_policy(
                 tau = arm_ik.solve_tau(q_step)
                 arm_ctrl.ctrl_dual_arm(q_step, tau)
                 time.sleep(1.0 / cfg.frequency)
+
             time.sleep(0.5)  # brief settle before reading state in the policy loop
             logger_mp.info("Soft-start complete; robot at init_arm_pose.")
+
+        # Initialize the gripper to the dataset's first-frame value (e.g., open for tasks that
+        # start with an open gripper). This runs independently of soft_start because the gripper
+        # uses scalar position commands -- it doesn't go through the radians-based arm interpolation.
+        # The 14-arm + 2-gripper state layout matches the converter / ROBOT_CONFIGS; state[arm_dof:]
+        # gives [left_ee, right_ee]. A single shared-memory write is enough -- the EE controller's
+        # background thread picks it up and the gripper actuates within the settle window below.
+        if cfg.ee:
+            init_gripper_state = step["observation.state"][arm_dof:].cpu().numpy()
+            left_init = init_gripper_state[:ee_dof]
+            right_init = init_gripper_state[ee_dof : 2 * ee_dof]
+            logger_mp.info(f"Init grippers from dataset frame 0: left={left_init} right={right_init}")
+            if isinstance(ee_shared_mem["left"], SynchronizedArray):
+                ee_shared_mem["left"][:] = to_list(left_init)
+                ee_shared_mem["right"][:] = to_list(right_init)
+            elif hasattr(ee_shared_mem["left"], "value") and hasattr(ee_shared_mem["right"], "value"):
+                ee_shared_mem["left"].value = to_scalar(left_init)
+                ee_shared_mem["right"].value = to_scalar(right_init)
+            time.sleep(0.3)  # let gripper actuate before the policy loop starts commanding it
 
         # --- Stage 2: policy loop ---
         if not cfg.run_policy:

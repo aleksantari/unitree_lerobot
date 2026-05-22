@@ -207,10 +207,14 @@ class G1_29_ArmIK:
         # in both the soft-start interpolation loop and the per-frame policy loop. Uses nv from
         # the reduced model so it scales to whatever joint count the URDF produces.
         try:
+            # pinocchio's rnea binding requires float64 ndarrays (Eigen double matrix). The policy
+            # outputs float32 -- cast explicitly so we don't get the "did not match C++ signature"
+            # error and silently fall through to zero torques.
+            q = np.ascontiguousarray(current_lr_arm_motor_q, dtype=np.float64)
             sol_tauff = pin.rnea(
                 self.reduced_robot.model,
                 self.reduced_robot.data,
-                current_lr_arm_motor_q,
+                q,
                 np.zeros(self.reduced_robot.model.nv),
                 np.zeros(self.reduced_robot.model.nv),
             )

@@ -4,8 +4,12 @@ Refer to:   lerobot/lerobot/scripts/eval.py
             lerobot/robot_devices/control_utils.py
 """
 
+import select
+import sys
+import termios
 import time
 import torch
+import tty
 import logging
 import cv2
 
@@ -166,6 +170,17 @@ def eval_policy(
             logger_mp.info("run_policy=false: skipping inference loop.")
             return
 
+        # Second confirmation: if soft-start just ran, give the human a chance to physically
+        # verify the robot is in the right pose before the policy starts driving it.
+        if cfg.soft_start:
+            confirm = input(
+                "Soft-start complete. Verify the robot is at the expected init pose, then enter 's' "
+                "to start the policy loop (anything else aborts): "
+            )
+            if confirm.lower() != "s":
+                logger_mp.info("Aborted between soft-start and policy loop.")
+                return
+
         logger_mp.info(
             f"Starting policy loop at {cfg.frequency} Hz "
             f"(max_steps={'unlimited' if cfg.max_steps == 0 else cfg.max_steps})."
@@ -177,6 +192,21 @@ def eval_policy(
         # check catches "the policy's first command is far from where the robot is right now."
         last_arm_action = np.asarray(arm_ctrl.get_current_dual_arm_q()).copy()
         logger_mp.info(f"Per-frame arm-delta cap: {_MAX_ARM_DELTA_PER_FRAME} rad (~{np.degrees(_MAX_ARM_DELTA_PER_FRAME):.1f}° per frame at {cfg.frequency} Hz).")
+
+        # Emergency-stop key setup: put stdin into cbreak so 'q' is captured as a single keypress
+        # (no Enter required). Only applies if stdin is a TTY -- if piped/redirected, fall back
+        # gracefully to no stop key (Ctrl+C still works).
+        stdin_is_tty = sys.stdin.isatty()
+        old_term_settings = None
+        if stdin_is_tty:
+            try:
+                old_term_settings = termios.tcgetattr(sys.stdin)
+                tty.setcbreak(sys.stdin.fileno())
+                logger_mp.info("Emergency stop: press 'q' (no Enter) at any time during the loop to abort safely.")
+            except Exception as e:
+                logger_mp.warning(f"Could not set terminal to cbreak mode; 'q' emergency stop disabled. ({e})")
+                old_term_settings = None
+
         while cfg.max_steps == 0 or idx < cfg.max_steps:
             loop_start_time = time.perf_counter()
             # 1. Get Observations
@@ -253,6 +283,15 @@ def eval_policy(
             if cfg.visualization:
                 visualization_data(idx, observation, state_tensor.numpy(), action_np, rerun_logger)
             idx += 1
+
+            # Emergency stop: non-blocking read of stdin. If 'q' was pressed, abort cleanly.
+            # Worst-case latency between keypress and abort is one loop period (~33ms at 30Hz).
+            if old_term_settings is not None and select.select([sys.stdin], [], [], 0)[0]:
+                ch = sys.stdin.read(1)
+                if ch.lower() == "q":
+                    logger_mp.warning("Emergency stop requested ('q' pressed). Aborting policy loop.")
+                    break
+
             # Maintain frequency
             time.sleep(max(0, (1.0 / cfg.frequency) - (time.perf_counter() - loop_start_time)))
 
@@ -261,6 +300,13 @@ def eval_policy(
     except Exception as e:
         logger_mp.info(f"An error occurred: {e}")
     finally:
+        # Restore terminal mode if we put it into cbreak for the emergency stop key.
+        # Critical: leaving the terminal in cbreak after the script exits makes the shell unusable.
+        if locals().get("old_term_settings") is not None:
+            try:
+                termios.tcsetattr(sys.stdin, termios.TCSADRAIN, locals()["old_term_settings"])
+            except Exception as term_err:
+                logger_mp.warning(f"Failed to restore terminal mode: {term_err}")
         # Guard with locals() in case setup failed before image_client was assigned.
         if "image_client" in locals():
             try:

@@ -47,7 +47,6 @@ from unitree_lerobot.eval_robot.utils.utils import (
     to_scalar,
     EvalRealConfig,
     TimingLog,
-    _REALTIME_BUDGET_MS,
 )
 from unitree_lerobot.eval_robot.utils.rerun_visualizer import RerunLogger, visualization_data
 
@@ -231,7 +230,9 @@ def eval_policy(
         # cfg.policy.pretrained_path points at .../checkpoints/<step>/pretrained_model so .parents[2] is <run>.
         run_dir = Path(cfg.policy.pretrained_path).resolve().parents[2]
         timing_dir = run_dir / "realtime_eval" / datetime.now().strftime("%Y%m%d_%H%M%S")
-        timing = TimingLog(out_dir=timing_dir)
+        # budget_hz=cfg.frequency so summary.txt's OK/BUSTED label and the Rerun budget line
+        # match whatever rate this run was launched at (e.g., 10 Hz for the slew-rate experiment).
+        timing = TimingLog(out_dir=timing_dir, budget_hz=cfg.frequency)
         logger_mp.info(f"Realtime eval logs -> {timing_dir}")
 
         # Opt-in Rerun session recording. rr.save adds a file sink to the active recording;
@@ -401,7 +402,7 @@ def eval_policy(
                 rr.log("timings/solve_tau_ms",      rr.Scalars(t_tau_ms))
                 rr.log("timings/ctrl_arm_ms",       rr.Scalars(t_ctrl_ms))
                 rr.log("timings/loop_total_ms",     rr.Scalars(t_loop_ms))
-                rr.log("timings/budget_ms",         rr.Scalars(_REALTIME_BUDGET_MS))
+                rr.log("timings/budget_ms",         rr.Scalars(timing.budget_ms))
                 rr.log("events/chunk_boundary",    rr.Scalars(1 if chunk_boundary else 0))
                 rr.log("events/missed_deadline",   rr.Scalars(1 if missed_deadline else 0))
                 rr.log("events/queue_len_before",  rr.Scalars(queue_len_before))

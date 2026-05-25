@@ -35,7 +35,12 @@ import rerun as rr
 # Make the repo root importable when running this file directly.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from unitree_lerobot.eval_robot.utils.utils import TimingLog, _REALTIME_BUDGET_MS
+from unitree_lerobot.eval_robot.utils.utils import TimingLog
+
+# The simulation models a 30 Hz on-robot loop, so we use 33.33 ms locally for the
+# "missed_deadline" math and pass budget_hz=30.0 into TimingLog explicitly.
+_SIM_BUDGET_HZ = 30.0
+_SIM_BUDGET_MS = 1000.0 / _SIM_BUDGET_HZ
 
 N_STEPS = int(os.environ.get("VIZ_TEST_STEPS", 100))
 SPAWN_VIEWER = os.environ.get("VIZ_TEST_NO_VIEWER", "") != "1"
@@ -58,7 +63,7 @@ def main() -> None:
         rr.init("viz_test", spawn=False)
         print("VIZ_TEST_NO_VIEWER=1: viewer skipped, only disk artifacts will be produced.")
 
-    timing = TimingLog(out_dir=out_dir)
+    timing = TimingLog(out_dir=out_dir, budget_hz=_SIM_BUDGET_HZ)
     rng = np.random.default_rng(42)
     cams = ("cam_left_high", "cam_right_high", "cam_left_wrist", "cam_right_wrist")
 
@@ -72,8 +77,8 @@ def main() -> None:
         t_tau_ms = 0.5 + rng.normal(0, 0.05)
         t_ctrl_ms = 1.0 + rng.normal(0, 0.1)
         t_loop_ms = t_obs_ms + t_infer_ms + t_tau_ms + t_ctrl_ms
-        missed_deadline = t_loop_ms > _REALTIME_BUDGET_MS
-        t_sleep_ms = max(0.0, _REALTIME_BUDGET_MS - t_loop_ms)
+        missed_deadline = t_loop_ms > _SIM_BUDGET_MS
+        t_sleep_ms = max(0.0, _SIM_BUDGET_MS - t_loop_ms)
         arm_delta_max = float(rng.uniform(0.001, 0.02))
 
         timing.append(
@@ -101,7 +106,7 @@ def main() -> None:
         rr.log("timings/solve_tau_ms",      rr.Scalars(t_tau_ms))
         rr.log("timings/ctrl_arm_ms",       rr.Scalars(t_ctrl_ms))
         rr.log("timings/loop_total_ms",     rr.Scalars(t_loop_ms))
-        rr.log("timings/budget_ms",         rr.Scalars(_REALTIME_BUDGET_MS))
+        rr.log("timings/budget_ms",         rr.Scalars(_SIM_BUDGET_MS))
         rr.log("events/chunk_boundary",     rr.Scalars(1 if chunk_boundary else 0))
         rr.log("events/missed_deadline",    rr.Scalars(1 if missed_deadline else 0))
         rr.log("events/queue_len_before",   rr.Scalars(queue_len_before))

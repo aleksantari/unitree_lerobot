@@ -22,6 +22,7 @@ Tunables:
 """
 
 import argparse
+import json
 from pathlib import Path
 
 import matplotlib
@@ -31,8 +32,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-_BUDGET_HZ = 30.0
-_BUDGET_MS = 1000.0 / _BUDGET_HZ
+_DEFAULT_BUDGET_HZ = 30.0
 
 
 def find_latest_run_dir(root: Path) -> Path:
@@ -45,13 +45,28 @@ def find_latest_run_dir(root: Path) -> Path:
 
 
 def load_run(run_dir: Path) -> dict:
-    """Load the per-step arrays from timing.npz."""
+    """Load the per-step arrays from timing.npz plus the budget from config.json.
+
+    `budget_hz` is read from <run_dir>/config.json's `frequency` field (written by
+    eval_g1.py's TimingLog.finalize via asdict(cfg)). Falls back to 30 Hz if the
+    config is missing (old runs predating this analyzer's budget plumbing).
+    """
     npz_path = run_dir / "timing.npz"
     if not npz_path.exists():
         raise FileNotFoundError(f"Missing timing.npz in {run_dir}")
     data = dict(np.load(npz_path))
     # abort_reason is a 0-d string array; convert to scalar.
     data["abort_reason"] = str(data["abort_reason"])
+    cfg_path = run_dir / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text())
+            data["budget_hz"] = float(cfg.get("frequency", _DEFAULT_BUDGET_HZ))
+        except Exception:
+            data["budget_hz"] = _DEFAULT_BUDGET_HZ
+    else:
+        data["budget_hz"] = _DEFAULT_BUDGET_HZ
+    data["budget_ms"] = 1000.0 / data["budget_hz"]
     return data
 
 
@@ -181,7 +196,9 @@ def plot_latency_timeline(data: dict, out: Path, skip_warmup: bool) -> None:
     ax.plot(step, t_loop, color="lightgrey", lw=0.7, label="t_loop_ms")
     ax.plot(step, t_infer, color="steelblue", lw=0.8, label="t_infer_ms")
     ax.scatter(step[cb], t_infer[cb], color="crimson", s=20, zorder=5, label="chunk_boundary=True")
-    ax.axhline(_BUDGET_MS, color="orange", ls="--", lw=1.0, label=f"{_BUDGET_HZ:.0f}Hz budget ({_BUDGET_MS:.1f}ms)")
+    budget_hz = data["budget_hz"]
+    budget_ms = data["budget_ms"]
+    ax.axhline(budget_ms, color="orange", ls="--", lw=1.0, label=f"{budget_hz:.0f}Hz budget ({budget_ms:.1f}ms)")
     ax.set_xlabel("step")
     ax.set_ylabel("latency (ms)")
     ax.set_title("Per-step inference & loop latency (chunk boundaries highlighted)")
@@ -199,14 +216,15 @@ def plot_latency_histogram(data: dict, out: Path, skip_warmup: bool) -> None:
     cb = data["chunk_boundary"][mask].astype(bool)
 
     fig, (ax_lin, ax_log) = plt.subplots(1, 2, figsize=(14, 5))
-    bins = np.linspace(0, max(t_infer.max(), _BUDGET_MS * 1.1), 80)
+    budget_ms = data["budget_ms"]
+    bins = np.linspace(0, max(t_infer.max(), budget_ms * 1.1), 80)
 
     for ax in (ax_lin, ax_log):
         ax.hist(t_infer[~cb], bins=bins, alpha=0.6, color="steelblue",
                 label=f"cached pop (n={(~cb).sum()})")
         ax.hist(t_infer[cb], bins=bins, alpha=0.6, color="crimson",
                 label=f"chunk boundary (n={cb.sum()})")
-        ax.axvline(_BUDGET_MS, color="orange", ls="--", lw=1.0, label=f"budget {_BUDGET_MS:.1f}ms")
+        ax.axvline(budget_ms, color="orange", ls="--", lw=1.0, label=f"budget {budget_ms:.1f}ms")
         ax.set_xlabel("t_infer_ms")
         ax.legend()
         ax.grid(alpha=0.3)
@@ -238,7 +256,8 @@ def plot_per_stage_breakdown(data: dict, out: Path, skip_warmup: bool) -> None:
     for name, vals in layers.items():
         ax.fill_between(step, bottom, bottom + vals, label=name, color=colors[name], alpha=0.8, lw=0)
         bottom = bottom + vals
-    ax.axhline(_BUDGET_MS, color="orange", ls="--", lw=1.0, label=f"budget {_BUDGET_MS:.1f}ms")
+    budget_ms = data["budget_ms"]
+    ax.axhline(budget_ms, color="orange", ls="--", lw=1.0, label=f"budget {budget_ms:.1f}ms")
     ax.set_xlabel("step")
     ax.set_ylabel("time per loop iter (ms)")
     ax.set_title("Per-stage latency stacked over time (obs + infer + tau + ctrl + sleep)")

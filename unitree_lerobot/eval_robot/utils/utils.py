@@ -19,25 +19,19 @@ logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
 
-# Real-time budget shared across offline (eval_g1_dataset.py) and on-robot (eval_g1.py) evals.
-# 30 Hz target matches the data collection cadence and the default cfg.frequency.
-_REALTIME_BUDGET_HZ = 30.0
-_REALTIME_BUDGET_MS = 1000.0 / _REALTIME_BUDGET_HZ
-
-
 def log_inference_times(label: str, times_ms: list[float]) -> None:
+    """Aggregate inference-time stats. Used by the offline eval (eval_g1_dataset.py).
+    On-robot eval (eval_g1.py) uses TimingLog instead, which carries its own runtime
+    budget derived from cfg.frequency."""
     if not times_ms:
         return
     arr = np.array(times_ms)
-    budget_ok = arr.max() < _REALTIME_BUDGET_MS
     logger_mp.info(
         f"{label} inference (ms): "
         f"mean={arr.mean():.2f} std={arr.std():.2f} "
         f"min={arr.min():.2f} max={arr.max():.2f} "
         f"p50={np.percentile(arr, 50):.2f} p95={np.percentile(arr, 95):.2f} p99={np.percentile(arr, 99):.2f} "
-        f"| n={len(arr)} | first={arr[0]:.2f} (incl. warm-up) "
-        f"| {_REALTIME_BUDGET_HZ:.0f}Hz budget ({_REALTIME_BUDGET_MS:.2f}ms): "
-        f"{'OK' if budget_ok else 'BUSTED'}"
+        f"| n={len(arr)} | first={arr[0]:.2f} (incl. warm-up)"
     )
 
 
@@ -67,6 +61,11 @@ class TimingLog:
     """
 
     out_dir: Path
+    # Budget for the OK/BUSTED labels in summary.txt and the Rerun budget reference line.
+    # Required -- caller must pass cfg.frequency (or whatever rate this run is paced at).
+    # No default: forces the caller to think about which budget applies to this run, so the
+    # summary label can't silently mismatch the actual loop rate.
+    budget_hz: float
     fields: tuple[str, ...] = (
         "step",
         "t_obs_ms",
@@ -85,6 +84,7 @@ class TimingLog:
         self.out_dir = Path(self.out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.out_dir / "timing.csv"
+        self.budget_ms = 1000.0 / self.budget_hz
         # buffering=1 → line-buffered text mode: each newline triggers a flush, so
         # `tail -f timing.csv` mid-run shows live data and SIGKILL leaves a usable file.
         self._csv = open(self.csv_path, "w", buffering=1)
@@ -151,13 +151,13 @@ class TimingLog:
         missed_deadline = np.array([int(r["missed_deadline"]) for r in rows])
 
         lines = [
-            f"Realtime eval summary  |  n_steps={n}  |  abort_reason={abort_reason}",
+            f"Realtime eval summary  |  n_steps={n}  |  abort_reason={abort_reason}  |  budget={self.budget_hz:.0f}Hz ({self.budget_ms:.2f}ms)",
             "",
             _format_stage_stats("process_obs_ms   ", t_obs),
-            _format_stage_stats("predict_action_ms", t_infer, budget_ms=_REALTIME_BUDGET_MS),
+            _format_stage_stats("predict_action_ms", t_infer, budget_ms=self.budget_ms),
             _format_stage_stats("solve_tau_ms     ", t_tau),
             _format_stage_stats("ctrl_arm_ms      ", t_ctrl),
-            _format_stage_stats("loop_total_ms    ", t_loop, budget_ms=_REALTIME_BUDGET_MS),
+            _format_stage_stats("loop_total_ms    ", t_loop, budget_ms=self.budget_ms),
             _format_stage_stats("sleep_ms         ", t_sleep),
             "",
             f"chunk_boundaries: {int(chunk_boundary.sum())} / {n} "

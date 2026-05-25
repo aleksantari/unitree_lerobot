@@ -174,7 +174,8 @@ done
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
     --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --cam_check_only=true'
+    --cam_check_only=true \
+    --visualization=true'
 
 # --- Stage 1: soft-start only (arms interpolate, policy does NOT run) ---
 # Linearly interpolates the arms over 3s from current pose to dataset frame 0 arm pose, then
@@ -184,7 +185,8 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
     --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --soft_start=true --run_policy=false'
+    --soft_start=true --run_policy=false \
+    --visualization=true'
 
 # --- Stage 2: policy only (robot must already be at init pose from a prior Stage 1) ---
 # Runs only the policy loop with a short cap. Gripper init still fires (independent of soft_start).
@@ -192,16 +194,19 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
     --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --soft_start=false --run_policy=true --max_steps=30'
+    --soft_start=false --run_policy=true --max_steps=30 \
+    --visualization=true'
 
 # --- Full eval: soft-start + policy (canonical command for an actual eval session) ---
 # Sequence: setup -> 1st 's' prompt -> 3s arm interpolation -> gripper init + 0.3s settle ->
 # 2nd 's' prompt (verify robot reached init pose) -> policy loop with 'q' e-stop armed ->
 # latency summary -> clean exit. max_steps=600 ≈ 20s at 30Hz; tune for longer rollouts.
+# --save_rrd=true persists the Rerun session to <run>/realtime_eval/<ts>/session.rrd for replay.
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
     --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --soft_start=true --run_policy=true --max_steps=600'
+    --soft_start=true --run_policy=true --max_steps=600 \
+    --visualization=true --save_rrd=true'
 
 # === Real-robot eval (eval_g1.py) — GR00T on the live G1+Dex1 ===
 # Uses the unified env `unitree-lerobot-groot` (cloned from unitree-lerobot + transformers/peft/timm/
@@ -225,28 +230,36 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
 
 # --- Stage 0: camera dry-run (zero motor risk) ---
 bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
-    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/012500/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --cam_check_only=true'
+    --cam_check_only=true \
+    --visualization=true'
 
 # --- Stage 1: soft-start only (arms interpolate, policy does NOT run) ---
 bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
-    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/012500/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
     --soft_start=true --run_policy=false'
 
 # --- Stage 2: policy only (robot must already be at init pose from a prior Stage 1) ---
 # max_steps=30 keeps the first GR00T-on-robot test to ~1s of motion -- finger on 'q' / Ctrl+C.
+# --save_rrd=true writes session.rrd alongside timing.npz so you can rewatch this short run too.
 bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
-    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/012500/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --soft_start=false --run_policy=true --max_steps=30'
+    --soft_start=false --run_policy=true --max_steps=30 \
+    --visualization=true --save_rrd=true'
 
 # --- Full eval: soft-start + policy (canonical GR00T-on-robot command) ---
+# --save_rrd=true records the full Rerun session to <run>/realtime_eval/<ts>/session.rrd
+# so the run can be rewatched later with: rerun <path-to-session.rrd>
+# Drop the flag for production runs where you don't want the disk write overhead
+# (~6 MB/s for 4 cams at 30Hz; ~120 MB for a 20-second max_steps=600 run).
 bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.eval_g1 \
-    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/012500/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
-    --soft_start=true --run_policy=true --max_steps=600'
+    --soft_start=true --run_policy=true --max_steps=600 \
+    --visualization=true --save_rrd=true'
 
 # === Attach to running tmux sessions ===
 tmux attach -t train_act          # ACT training

@@ -17,11 +17,17 @@ class RerunLogger:
         prefix: str = "",
         memory_limit: str = "200MB",
         idxrangeboundary: int | None = 300,
+        spawn: bool = True,
     ):
-        """Initializes the Rerun logger."""
+        """Initializes the Rerun logger.
+
+        spawn=False initializes the recording but does NOT open the live viewer
+        — useful when the caller only wants to record to a file via rr.save(...).
+        """
         # Use a descriptive name for the Rerun recording
         rr.init(f"Dataset_Log_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
-        rr.spawn(memory_limit=memory_limit)
+        if spawn:
+            rr.spawn(memory_limit=memory_limit)
 
         self.prefix = prefix
         self.blueprint_sent = False
@@ -122,7 +128,7 @@ class RerunLogger:
 
         if self._index_key in step_data:
             current_index = step_data[self._index_key].item()
-            rr.set_time_sequence("frame", current_index)
+            rr.set_time("frame", sequence=current_index)
 
         episode_idx = step_data.get(self._episode_index_key, torch.tensor(-1)).item()
         if episode_idx != self.current_episode:
@@ -145,13 +151,13 @@ class RerunLogger:
             state_tensor = step_data[self._state_key]
             entity_path = f"{self.prefix}state"
             for i, val in enumerate(state_tensor):
-                rr.log(f"{entity_path}/joint_{i}", rr.Scalar(val.item()))
+                rr.log(f"{entity_path}/joint_{i}", rr.Scalars(val.item()))
 
         if self._action_key in step_data:
             action_tensor = step_data[self._action_key]
             entity_path = f"{self.prefix}action"
             for i, val in enumerate(action_tensor):
-                rr.log(f"{entity_path}/joint_{i}", rr.Scalar(val.item()))
+                rr.log(f"{entity_path}/joint_{i}", rr.Scalars(val.item()))
 
 
 def visualization_data(idx, observation, state, action, online_logger):

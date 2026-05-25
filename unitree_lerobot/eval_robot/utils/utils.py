@@ -1,5 +1,7 @@
+import json
 import numpy as np
 import torch
+from pathlib import Path
 from typing import Any
 from contextlib import nullcontext
 from copy import copy
@@ -37,6 +39,147 @@ def log_inference_times(label: str, times_ms: list[float]) -> None:
         f"| {_REALTIME_BUDGET_HZ:.0f}Hz budget ({_REALTIME_BUDGET_MS:.2f}ms): "
         f"{'OK' if budget_ok else 'BUSTED'}"
     )
+
+
+def _format_stage_stats(label: str, arr_ms: np.ndarray, budget_ms: float | None = None) -> str:
+    """One-line per-stage stats. Used by TimingLog's summary."""
+    if arr_ms.size == 0:
+        return f"{label}: (no data)"
+    line = (
+        f"{label}: mean={arr_ms.mean():.2f} std={arr_ms.std():.2f} "
+        f"min={arr_ms.min():.2f} max={arr_ms.max():.2f} "
+        f"p50={np.percentile(arr_ms, 50):.2f} p95={np.percentile(arr_ms, 95):.2f} p99={np.percentile(arr_ms, 99):.2f} "
+        f"| n={len(arr_ms)}"
+    )
+    if budget_ms is not None:
+        line += f" | budget {budget_ms:.2f}ms: {'OK' if arr_ms.max() < budget_ms else 'BUSTED'}"
+    return line
+
+
+@dataclass
+class TimingLog:
+    """Per-step latency capture for eval_g1.py's policy loop.
+
+    Writes one line to timing.csv per loop iteration (line-buffered, atomic on
+    most filesystems → survives SIGKILL up to the last completed step). Keeps
+    rows in memory so finalize() can produce a compressed npz + summary at the
+    end of the run (also runs from `finally` so Ctrl+C is preserved cleanly).
+    """
+
+    out_dir: Path
+    fields: tuple[str, ...] = (
+        "step",
+        "t_obs_ms",
+        "t_infer_ms",
+        "t_tau_ms",
+        "t_ctrl_ms",
+        "t_loop_ms",
+        "t_sleep_ms",
+        "chunk_boundary",
+        "queue_len_before",
+        "missed_deadline",
+        "arm_delta_max",
+    )
+
+    def __post_init__(self):
+        self.out_dir = Path(self.out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.csv_path = self.out_dir / "timing.csv"
+        # buffering=1 → line-buffered text mode: each newline triggers a flush, so
+        # `tail -f timing.csv` mid-run shows live data and SIGKILL leaves a usable file.
+        self._csv = open(self.csv_path, "w", buffering=1)
+        self._csv.write(",".join(self.fields) + "\n")
+        self.rows: list[dict] = []
+        self.actions: list[np.ndarray] = []
+        self.states: list[np.ndarray] = []
+        self._finalized = False
+
+    def append(self, **kwargs) -> None:
+        # Store raw values (float/int) in self.rows so npz inherits proper dtypes.
+        # Format only on the CSV side so the human-readable file stays tidy.
+        row = {f: kwargs.get(f, "") for f in self.fields}
+
+        def _csv_fmt(v):
+            if isinstance(v, float):
+                return f"{v:.4f}"
+            return str(v)
+
+        self._csv.write(",".join(_csv_fmt(row[f]) for f in self.fields) + "\n")
+        self.rows.append(row)
+
+    def add_step_data(self, action: np.ndarray, state: np.ndarray) -> None:
+        self.actions.append(np.asarray(action).copy())
+        self.states.append(np.asarray(state).copy())
+
+    def finalize(self, abort_reason: str, cfg_snapshot: dict | None = None) -> None:
+        """Idempotent: safe to call from finally even after an early abort."""
+        if self._finalized:
+            return
+        self._finalized = True
+        try:
+            self._csv.flush()
+            self._csv.close()
+        except Exception:
+            pass
+        if not self.rows:
+            return
+        arr = {f: np.array([r[f] for r in self.rows]) for f in self.fields}
+        np.savez_compressed(
+            self.out_dir / "timing.npz",
+            **arr,
+            actions=np.stack(self.actions) if self.actions else np.empty(0),
+            states=np.stack(self.states) if self.states else np.empty(0),
+            abort_reason=np.asarray(abort_reason),
+        )
+        if cfg_snapshot is not None:
+            (self.out_dir / "config.json").write_text(
+                json.dumps(cfg_snapshot, indent=2, default=str)
+            )
+        self._write_summary(abort_reason)
+
+    def _write_summary(self, abort_reason: str) -> None:
+        rows = self.rows
+        n = len(rows)
+        get = lambda f: np.array([float(r[f]) for r in rows])  # noqa: E731
+        t_obs = get("t_obs_ms")
+        t_infer = get("t_infer_ms")
+        t_tau = get("t_tau_ms")
+        t_ctrl = get("t_ctrl_ms")
+        t_loop = get("t_loop_ms")
+        t_sleep = get("t_sleep_ms")
+        chunk_boundary = np.array([int(r["chunk_boundary"]) for r in rows])
+        missed_deadline = np.array([int(r["missed_deadline"]) for r in rows])
+
+        lines = [
+            f"Realtime eval summary  |  n_steps={n}  |  abort_reason={abort_reason}",
+            "",
+            _format_stage_stats("process_obs_ms   ", t_obs),
+            _format_stage_stats("predict_action_ms", t_infer, budget_ms=_REALTIME_BUDGET_MS),
+            _format_stage_stats("solve_tau_ms     ", t_tau),
+            _format_stage_stats("ctrl_arm_ms      ", t_ctrl),
+            _format_stage_stats("loop_total_ms    ", t_loop, budget_ms=_REALTIME_BUDGET_MS),
+            _format_stage_stats("sleep_ms         ", t_sleep),
+            "",
+            f"chunk_boundaries: {int(chunk_boundary.sum())} / {n} "
+            f"({100.0 * chunk_boundary.mean():.1f}%)",
+            f"missed_deadlines: {int(missed_deadline.sum())} / {n} "
+            f"({100.0 * missed_deadline.mean():.1f}%)",
+        ]
+        if chunk_boundary.any() and (~chunk_boundary.astype(bool)).any():
+            cb = chunk_boundary.astype(bool)
+            lines.append("")
+            lines.append(
+                f"predict_action_ms at chunk_boundary=True : "
+                f"mean={t_infer[cb].mean():.2f} max={t_infer[cb].max():.2f} (n={cb.sum()})"
+            )
+            lines.append(
+                f"predict_action_ms at chunk_boundary=False: "
+                f"mean={t_infer[~cb].mean():.2f} max={t_infer[~cb].max():.2f} (n={(~cb).sum()})"
+            )
+        summary = "\n".join(lines)
+        (self.out_dir / "summary.txt").write_text(summary + "\n")
+        for line in lines:
+            logger_mp.info(line)
 
 
 def extract_observation(step: dict):
@@ -212,6 +355,7 @@ class EvalRealConfig:
     soft_start: bool = False  # Stage 1: linearly interpolate the arms from the current pose to init_arm_pose before the policy loop.
     run_policy: bool = False  # Stage 2: run the inference loop (sends actions to arms + EE). Assumes the robot is already at init_arm_pose unless soft_start is also set.
     max_steps: int = 0  # Cap on policy loop iterations; 0 means unlimited (original while-True behavior).
+    save_rrd: bool = False  # If True, also record the Rerun session to <realtime_eval/<ts>/session.rrd so the run can be replayed later (rerun <path>.rrd). Independent of `visualization` — image/scalar logging is enabled by either flag.
     send_real_robot: bool = False  # Legacy; eval_g1.py no longer references this. Kept for dataclass-import compatibility.
     use_dataset: bool = False
 

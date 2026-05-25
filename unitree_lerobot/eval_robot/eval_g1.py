@@ -272,7 +272,7 @@ def eval_policy(
             loop_start_time = time.perf_counter()
 
             # === Stage A: observations ===
-            t_obs_start = time.perf_counter()
+            t_obs_start = time.perf_counter() 
             observation, current_arm_q = process_images_and_observations(
                 image_client, image_config, arm_ctrl
             )

@@ -261,6 +261,27 @@ bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robo
     --soft_start=true --run_policy=true --max_steps=600 \
     --visualization=true --save_rrd=true'
 
+# === Analyze a realtime_eval/<ts>/ directory produced by eval_g1.py ===
+# Loads timing.npz, prints a structured summary (loop timing, chunk-boundary latency split,
+# deadline misses, action-discontinuity stats), and writes 5 PNG plots into the same dir:
+#   analysis_latency_timeline.png    per-step t_infer / t_loop with chunk_boundary markers
+#   analysis_latency_histogram.png   t_infer_ms histograms split by chunk_boundary
+#   analysis_per_stage_breakdown.png stacked area of obs/infer/tau/ctrl/sleep over time
+#   analysis_action_trajectory.png   16 commanded action lanes over time (arm + grippers)
+#   analysis_action_delta.png        per-step jump magnitude with chunk boundaries highlighted
+# No --run_dir argument: auto-picks the most-recently-modified realtime_eval/<ts>/ under outputs/train/.
+
+# --- Auto-pick most recent realtime_eval (any policy) ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.analyze_realtime_eval'
+
+# --- Latest GR00T realtime_eval ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.analyze_realtime_eval \
+    --run_dir outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/realtime_eval/20260525_105825'
+
+# --- Latest ACT realtime_eval ---
+bash -ic 'use_conda unitree-lerobot-groot && python -m unitree_lerobot.eval_robot.analyze_realtime_eval \
+    --run_dir outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/realtime_eval/20260525_110653'
+
 # === Attach to running tmux sessions ===
 tmux attach -t train_act          # ACT training
 tmux attach -t convert_sorting    # tool_0_sorting conversion

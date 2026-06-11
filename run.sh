@@ -203,7 +203,7 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
 # latency summary -> clean exit. max_steps=600 ≈ 20s at 30Hz; tune for longer rollouts.
 # --save_rrd=true persists the Rerun session to <run>/realtime_eval/<ts>/session.rrd for replay.
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1 \
-    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/065000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
     --soft_start=true --run_policy=true --max_steps=600 \
     --visualization=true --save_rrd=true'

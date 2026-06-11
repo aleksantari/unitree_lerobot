@@ -48,12 +48,14 @@ logger_mp = logging_mp.getLogger(__name__)
 logger_mp.setLevel(logging_mp.INFO)
 
 
-def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
-    # Honors cfg.output_dir if set. Otherwise lands under the checkpoint's run dir at
-    # <run>/eval/<dataset_safe>/<step>, so evals on different checkpoints don't clobber each other.
-    # The step subdir is omitted if the path doesn't follow the canonical lerobot checkpoint layout
-    # (<run>/checkpoints/<step>/pretrained_model) — detected by isdigit() on the parent dir name.
-    # Fallback for random-weight runs (no pretrained_path): write to ./eval_outputs/<dataset_safe>.
+def _resolve_output_dir(cfg: OfflineEvalConfig, variant_tag: str | None = None) -> Path:
+    # Honors cfg.output_dir if set (verbatim, no variant tag — explicit path = full manual control).
+    # Otherwise lands under the checkpoint's run dir at <run>/eval/<dataset_safe>/<step>/<variant>, so
+    # evals on different checkpoints don't clobber each other AND different inference variants of the same
+    # checkpoint (e.g. denoise steps 4 vs 8) land in sibling dirs. The step subdir is omitted if the path
+    # doesn't follow the canonical lerobot checkpoint layout (<run>/checkpoints/<step>/pretrained_model) —
+    # detected by isdigit() on the parent dir name. The variant subdir is omitted when variant_tag is None.
+    # Fallback for random-weight runs (no pretrained_path): write to ./eval_outputs/<dataset_safe>/<variant>.
     if cfg.output_dir is not None:
         return Path(cfg.output_dir)
     if cfg.policy is not None and cfg.policy.pretrained_path is not None:
@@ -64,8 +66,11 @@ def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
         step_dir_name = ckpt_path.parent.name
         if step_dir_name.isdigit():
             eval_dir = eval_dir / step_dir_name
-        return eval_dir
-    return Path("eval_outputs") / cfg.repo_id.replace("/", "__")
+    else:
+        eval_dir = Path("eval_outputs") / cfg.repo_id.replace("/", "__")
+    if variant_tag:
+        eval_dir = eval_dir / variant_tag
+    return eval_dir
 
 
 def _compute_episode_metrics(
@@ -117,6 +122,54 @@ def _resolve_action_dim_names(dataset: LeRobotDataset, action_dim: int) -> list[
         f"falling back to generic 'Dim N' labels (expected {action_dim} names)."
     )
     return [f"Dim {i + 1}" for i in range(action_dim)]
+
+
+def _denoising_heads(policy: nn.Module) -> list[nn.Module]:
+    # GR00T's flow-matching action head exposes num_inference_timesteps (read live in its sampling loop,
+    # flow_matching_action_head.py). Found by attribute rather than a hardcoded path so it survives the
+    # _groot_model/action_head nesting. Empty for ACT (no denoising loop).
+    return [m for m in policy.modules() if hasattr(m, "num_inference_timesteps")]
+
+
+def _set_denoising_steps(policy: nn.Module, n: int) -> None:
+    # Overriding the attribute on the built module changes the denoising-step count with no rebuild. The
+    # value isn't a GrootConfig field (it comes from the base GR00T-N1.5 action_head_cfg, default 4), so a
+    # --policy.* CLI override can't reach it — we set it here.
+    heads = _denoising_heads(policy)
+    if not heads:
+        logger_mp.warning(
+            f"--num_inference_timesteps={n} requested but no flow-matching action head was found on this "
+            f"policy. This knob only applies to GR00T-style diffusion policies; ACT has no denoising loop. "
+            f"Leaving the policy unchanged."
+        )
+        return
+    for h in heads:
+        old = h.num_inference_timesteps
+        h.num_inference_timesteps = n
+        logger_mp.info(f"Denoising steps on {type(h).__name__}.num_inference_timesteps: {old} -> {n}")
+
+
+def _get_denoising_steps(policy: nn.Module) -> int | None:
+    # Effective denoising-step count after any override (the base GR00T-N1.5 default is 4). None for ACT.
+    # Used to tag the output dir so denoise-step variants of the same checkpoint don't collide.
+    heads = _denoising_heads(policy)
+    return heads[0].num_inference_timesteps if heads else None
+
+
+def _variant_tag(cfg: OfflineEvalConfig, denoising_steps: int | None) -> str | None:
+    # Encodes the inference-time configuration that distinguishes runs of the SAME checkpoint+episode, so
+    # e.g. 4-step and 8-step GR00T evals land in sibling dirs instead of clobbering each other. Pieces are
+    # only added when relevant: `steps{N}` for diffusion policies (omitted for ACT), `seed{N}` when a seed
+    # is set, plus any free-form cfg.tag. Returns None when there's nothing to distinguish (e.g. plain ACT,
+    # no seed, no tag) so that case keeps the flat <step>/ layout.
+    pieces = []
+    if denoising_steps is not None:
+        pieces.append(f"steps{denoising_steps}")
+    if cfg.seed is not None:
+        pieces.append(f"seed{cfg.seed}")
+    if cfg.tag:
+        pieces.append(cfg.tag)
+    return "_".join(pieces) if pieces else None
 
 
 def _build_deployed_stream(predicted_chunks: np.ndarray, ground_truth: np.ndarray, k: int) -> np.ndarray:
@@ -238,6 +291,7 @@ def eval_policy(
     policy: PreTrainedPolicy | None = None,
     preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None,
     postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None,
+    variant_tag: str | None = None,
 ):
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
@@ -253,8 +307,8 @@ def eval_policy(
         preprocessor.reset()
         postprocessor.reset()
 
-    # ----- Resolve and prepare output directory -----
-    output_dir = _resolve_output_dir(cfg)
+    # ----- Resolve and prepare output directory (variant_tag separates inference variants) -----
+    output_dir = _resolve_output_dir(cfg, variant_tag)
     output_dir.mkdir(parents=True, exist_ok=True)
     logger_mp.info(f"Eval outputs will be written to: {output_dir}")
 
@@ -407,6 +461,15 @@ def eval_main(cfg: OfflineEvalConfig):
     policy = make_policy(cfg=cfg.policy, ds_meta=dataset.meta)
     policy.eval()
 
+    # GR00T-only: override flow-matching denoising steps at eval time (no-op for ACT).
+    if cfg.num_inference_timesteps is not None:
+        _set_denoising_steps(policy, cfg.num_inference_timesteps)
+
+    # Tag the output dir with the inference variant (effective denoise steps + seed + cfg.tag) so runs of
+    # the same checkpoint/episode under different settings sit in sibling dirs instead of overwriting.
+    variant_tag = _variant_tag(cfg, _get_denoising_steps(policy))
+    logger_mp.info(f"Output variant tag: {variant_tag or '(none — flat <step>/ layout)'}")
+
     preprocessor, postprocessor = make_pre_post_processors(
         policy_cfg=cfg.policy,
         pretrained_path=cfg.policy.pretrained_path,
@@ -419,7 +482,7 @@ def eval_main(cfg: OfflineEvalConfig):
 
     # ----- Run eval inside no_grad + (optional) autocast context -----
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        eval_policy(cfg, dataset, policy, preprocessor, postprocessor)
+        eval_policy(cfg, dataset, policy, preprocessor, postprocessor, variant_tag=variant_tag)
 
     logging.info("End of eval")
 

@@ -16,7 +16,7 @@ bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval
     --episodes 0 10 20 30'
 ```
 
-(GR00T: run in the `lerobot-gr00t` env and pass `--seed=N` for reproducible diffusion sampling.)
+(GR00T: run in the `lerobot-gr00t` env and pass `--seed=N` for reproducible diffusion sampling. `--num_inference_timesteps=N` overrides the flow-matching denoising-step count at eval time — base GR00T-N1.5 default is 4; it is not a `GrootConfig` field, so the script sets `num_inference_timesteps` directly on the action-head module after load. No-op for ACT. More steps = finer ODE integration at the cost of a proportionally slower action head.)
 
 ## Three per-episode plots
 
@@ -58,7 +58,7 @@ Per-episode + aggregate inference-time summary (mean / std / min / max / p50 / p
 ## Output layout
 
 ```
-outputs/train/<run>/eval/<dataset_safe>/<step>/
+outputs/train/<run>/eval/<dataset_safe>/<step>/<variant>/
 ├── metrics.json
 └── episodes/
     └── episode_NNN/
@@ -67,7 +67,15 @@ outputs/train/<run>/eval/<dataset_safe>/<step>/
         └── 3_deployed_full_chunk.png
 ```
 
-`<dataset_safe>` = `repo_id.replace("/", "__")`; `<step>` inferred from the canonical `checkpoints/<step>/pretrained_model` layout (omitted for non-canonical paths). Override the whole path with `--output_dir`. Falls back to `./eval_outputs/<dataset_safe>` for from-scratch (no-pretrained) runs.
+`<dataset_safe>` = `repo_id.replace("/", "__")`; `<step>` inferred from the canonical `checkpoints/<step>/pretrained_model` layout (omitted for non-canonical paths). Override the whole path with `--output_dir` (verbatim, no `<variant>` appended). Falls back to `./eval_outputs/<dataset_safe>/<variant>` for from-scratch (no-pretrained) runs.
+
+**`<variant>` subdir** — auto-encodes the inference configuration that distinguishes runs of the *same* checkpoint+episode, so e.g. a 4-step and an 8-step GR00T eval land in **sibling dirs instead of clobbering each other**. Built by `_variant_tag`, pieces added only when relevant:
+
+- `steps{N}` — effective flow-matching denoising steps (diffusion policies only; omitted for ACT).
+- `seed{N}` — when `--seed` is set.
+- free-form `--tag=<label>` appended last (for ablations the auto-tag can't capture).
+
+When none apply (plain ACT, no seed, no tag) the `<variant>` subdir is omitted and outputs stay flat at `<step>/` (backward-compatible). Example: `…/017500/steps4_seed42/` next to `…/017500/steps8_seed42/`.
 
 ## Removed vs the old docs
 

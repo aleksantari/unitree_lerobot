@@ -393,6 +393,14 @@ class OfflineEvalConfig:
     # None => auto (max(1, T // 120)): legible on long episodes, every-frame on short ones.
     # Set an explicit int to override; fan_stride=1 forces a fan from every frame.
     fan_stride: int | None = None
+    # GR00T-only: number of flow-matching denoising steps at inference (base GR00T-N1.5 default = 4).
+    # None leaves the model's built-in count untouched; an int (e.g. 8) overrides it at eval time by
+    # setting num_inference_timesteps on the action head. Ignored for ACT (no diffusion head).
+    num_inference_timesteps: int | None = None
+    # Free-form experiment label appended to the auto-generated output-dir variant tag (see
+    # eval_g1_dataset._variant_tag). Use it to distinguish runs the auto-tag can't capture (e.g. an
+    # ablation). Only applied to the default checkpoint-adjacent path, not to an explicit --output_dir.
+    tag: str = ""
 
     rename_map: dict[str, str] = field(default_factory=dict)
 

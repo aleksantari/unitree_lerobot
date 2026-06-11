@@ -113,8 +113,10 @@ bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
 #   metrics.json   per-dim MSE/MAE, mean_l2 (fresh), mean_l2_deployed_full_chunk (+ cross-episode aggregate)
 # No predictions.npz / horizon-decay anymore (removed 2026-06-10; inference is cheap, just re-run).
 # Joint names (e.g. kLeftShoulderPitch) come from the dataset's action feature schema -> subplot ylabels + JSON keys.
-# Outputs land at <run>/eval/<dataset_safe>/<step>/ -- step-stamped so multi-checkpoint sweeps
-# don't clobber each other. Override with --output_dir=<path> if needed.
+# Outputs land at <run>/eval/<dataset_safe>/<step>/[<variant>/] -- step-stamped so multi-checkpoint
+# sweeps don't clobber each other, plus an optional <variant> subdir (e.g. steps8_seed42) that
+# separates inference variants of the SAME checkpoint (denoise steps / seed / --tag). Plain ACT with
+# no seed stays flat at <step>/. Override the whole path with --output_dir=<path> (verbatim, no variant).
 # --episodes is our hold-out [0,10,20,30] for the sorting dataset; swap to any indices to spot-check.
 # --fan_stride controls the chunk-fan density: omit for auto (max(1, T//120); legible on long episodes,
 #   every-frame on short ones), or pass --fan_stride=1 to draw a chunk from EVERY frame (dense, slower).
@@ -141,11 +143,14 @@ for step in 005000 020000 050000 095000; do
 done
 
 # === Offline eval GR00T-N1.5 on combined dataset (lerobot-gr00t env) ===
-# Same script as the ACT eval -- it's policy-agnostic. Two GR00T-specific notes:
+# Same script as the ACT eval -- it's policy-agnostic. Three GR00T-specific notes:
 #   1. GR00T sampling is stochastic (diffusion). Pass --seed=N to lock the sampling and
 #      get reproducible metrics across re-runs of the same checkpoint.
 #   2. Use explicit numeric checkpoint paths (NOT checkpoints/last/) so the eval output
 #      gets a clean step subdir; "last" isn't numeric and the step subdir gets skipped.
+#   3. --num_inference_timesteps=N overrides the flow-matching denoising-step count at eval
+#      time (base GR00T-N1.5 default = 4). More steps = finer ODE integration, slower head.
+#      The startup log prints the override (e.g. "num_inference_timesteps: 4 -> 8"). No-op for ACT.
 # Combined dataset has 222 episodes: sorting offsets 0-112, handover offsets 113-221.
 # Standard hold-out: [0,10,20,30] from sorting + [113,123,133,143] from handover.
 bash -ic 'use_conda lerobot-gr00t && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
@@ -153,6 +158,22 @@ bash -ic 'use_conda lerobot-gr00t && python -m unitree_lerobot.eval_robot.eval_g
     --repo_id=aleksantari/g1_dex1_tools_combined \
     --episodes "[0,10,20,30,113,123,133,143]" \
     --seed=42'
+
+# Denoising-step sweep: re-run the same checkpoint at 8 steps to compare against the 4-step default.
+# Keep --seed fixed so the noise draw is identical and the only changed variable is the step count.
+# Outputs auto-separate by inference variant -- no --output_dir juggling. The default (4-step) run above
+# lands in .../017500/steps4_seed42/ and this 8-step run in .../017500/steps8_seed42/, side by side:
+#   <run>/eval/<dataset_safe>/<step>/
+#   ├── steps4_seed42/   metrics.json + episodes/episode_NNN/{1,2,3}_*.png
+#   └── steps8_seed42/   metrics.json + episodes/episode_NNN/{1,2,3}_*.png
+# Compare metrics.json across the two, or overlay the per-episode plots. Add --tag=<label> to append a
+# free-form suffix (e.g. steps8_seed42_<label>) for ablations the auto-tag doesn't capture.
+bash -ic 'use_conda lerobot-gr00t && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+    --policy.path=outputs/train/2026-05-20/15-28-24_groot_g1_dex1_tools_combined/checkpoints/017500/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tools_combined \
+    --episodes "[0,10,20,30,113,123,133,143]" \
+    --seed=42 \
+    --num_inference_timesteps=8'
 
 # === Sweep eval across multiple GR00T checkpoints ===
 # Same shape as the ACT sweep, just with the lerobot-gr00t env and a seed for reproducibility.

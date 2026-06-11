@@ -1,6 +1,8 @@
 # Robust offline policy evaluation — design reference
 
-> **Status:** reference document for the planned redesign of [`eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py). Implementation is **incremental** — sections will be built, observed, and iterated. Treat this doc as the north star, not a contract; deviations are expected and welcome as we see what's actually useful.
+> ⚠️ **DEPRECATED (2026-06-10).** This document describes an earlier iteration and no longer matches [`eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py). The chunk-per-frame inference design and output-path scheme still hold, but the **horizon-decay** curve/metric and the **`predictions.npz`** dump have been removed, the plot filenames changed, and `metrics.json`'s schema changed. For what the script actually does today, see [`offline_eval_current.md`](offline_eval_current.md). **Kept** for the design rationale and the deferred/future-analysis ideas (horizon decay, post-hoc cadence sweep from saved chunks, per-task breakdown, language-prompt override) that may be worth revisiting.
+
+> **Status (historical):** reference document for the planned redesign of [`eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py). Implementation is **incremental** — sections will be built, observed, and iterated. Treat this doc as the north star, not a contract; deviations are expected and welcome as we see what's actually useful.
 
 ## Context
 

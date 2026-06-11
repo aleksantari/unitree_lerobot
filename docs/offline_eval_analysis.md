@@ -1,5 +1,7 @@
 # Offline policy evaluation — output reference
 
+> ⚠️ **DEPRECATED (2026-06-10).** This guide describes outputs that no longer exist. The current [`eval_g1_dataset.py`](../unitree_lerobot/eval_robot/eval_g1_dataset.py) produces three plots (`1_fresh_chunk0.png`, `2_chunk_fan.png`, `3_deployed_full_chunk.png`) and **no longer** writes the horizon-decay plot or `predictions.npz`; `metrics.json` dropped `horizon_decay_mse` and added `mean_l2_deployed_full_chunk`. For the current outputs see [`offline_eval_current.md`](offline_eval_current.md). **Kept** for the prose explanations of horizon decay and the chunk-vs-deployment framing, which still illuminate the concepts even though the horizon-decay output itself was removed.
+
 > A short reader-friendly guide to the outputs produced by our offline policy evaluation script. The eval runs a trained imitation-learning policy (ACT or GR00T) against held-out episodes from the training dataset and produces per-episode plots and saved arrays. This doc explains what each output represents and how to read it.
 
 ## What's being evaluated

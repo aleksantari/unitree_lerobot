@@ -105,17 +105,30 @@ bash -ic 'use_conda lerobot-gr00t && python -m lerobot.scripts.lerobot_train \
 
 # === Offline eval: predict_chunk against dataset episodes ===
 # Loads a checkpoint, calls policy.predict_action_chunk on every frame of the chosen episodes,
-# and produces per-episode trajectory + horizon-decay plots, a predictions.npz with the raw
-# (T, chunk_size, action_dim) tensor, and a metrics.json with per-dim MSE/MAE, mean_l2, and
-# horizon-decay (per episode + cross-episode aggregate). Joint names (e.g. kLeftShoulderPitch)
-# are pulled from the dataset's action feature schema and used as subplot ylabels + metrics.json keys.
+# and writes three per-episode plots + a metrics.json. See docs/offline_eval_current.md.
+#   episodes/episode_NNN/1_fresh_chunk0.png        GT vs chunk[0] per frame (n_action_steps=1 upper bound)
+#   episodes/episode_NNN/2_chunk_fan.png           full chunk drawn at each obs step, colored by start time
+#                                                  (drift view) -- sub-sampled via --fan_stride (see below)
+#   episodes/episode_NNN/3_deployed_full_chunk.png realtime deploy at n_action_steps=chunk_size (staleness view)
+#   metrics.json   per-dim MSE/MAE, mean_l2 (fresh), mean_l2_deployed_full_chunk (+ cross-episode aggregate)
+# No predictions.npz / horizon-decay anymore (removed 2026-06-10; inference is cheap, just re-run).
+# Joint names (e.g. kLeftShoulderPitch) come from the dataset's action feature schema -> subplot ylabels + JSON keys.
 # Outputs land at <run>/eval/<dataset_safe>/<step>/ -- step-stamped so multi-checkpoint sweeps
 # don't clobber each other. Override with --output_dir=<path> if needed.
 # --episodes is our hold-out [0,10,20,30] for the sorting dataset; swap to any indices to spot-check.
+# --fan_stride controls the chunk-fan density: omit for auto (max(1, T//120); legible on long episodes,
+#   every-frame on short ones), or pass --fan_stride=1 to draw a chunk from EVERY frame (dense, slower).
 bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
     --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
     --repo_id=aleksantari/g1_dex1_tool_0_sorting \
     --episodes "[0,10,20,30]"'
+
+# Same, but force a chunk-fan from every frame (densest 2_chunk_fan.png):
+bash -ic 'use_conda unitree-lerobot && python -m unitree_lerobot.eval_robot.eval_g1_dataset \
+    --policy.path=outputs/train/2026-05-19/19-07-27_act_g1_dex1_tool_0_sorting/checkpoints/095000/pretrained_model \
+    --repo_id=aleksantari/g1_dex1_tool_0_sorting \
+    --episodes "[0,10,20,30]" \
+    --fan_stride=1'
 
 # === Sweep eval across multiple ACT checkpoints ===
 # Each iteration writes to its own <step>/ subfolder. Adjust the step list to whatever

@@ -389,6 +389,10 @@ class OfflineEvalConfig:
     visualization: bool = False
     output_dir: str | None = None
     seed: int | None = None
+    # Chunk-fan plot (2_chunk_fan.png) draws one predicted chunk every `fan_stride` frames.
+    # None => auto (max(1, T // 120)): legible on long episodes, every-frame on short ones.
+    # Set an explicit int to override; fan_stride=1 forces a fan from every frame.
+    fan_stride: int | None = None
 
     rename_map: dict[str, str] = field(default_factory=dict)
 

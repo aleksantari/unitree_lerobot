@@ -11,6 +11,8 @@ import logging
 import time
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -69,31 +71,33 @@ def _resolve_output_dir(cfg: OfflineEvalConfig) -> Path:
 def _compute_episode_metrics(
     predicted_chunks: np.ndarray,
     ground_truth: np.ndarray,
-    horizon_decay_mse: np.ndarray,
+    deployed: np.ndarray,
 ) -> dict:
-    # All metrics here are over the fresh-prediction stream — chunk[0] per frame, no deployment staleness.
+    # mean_l2 / per-dim errors are over the fresh-prediction stream (chunk[0] per frame, no deployment
+    # staleness — the upper bound). mean_l2_deployed_full_chunk is the same metric on the n_action_steps=K
+    # deployment stream, so its ratio to mean_l2 quantifies the staleness penalty of full-chunk deployment.
     first_action_stream = predicted_chunks[:, 0, :]
     error = first_action_stream - ground_truth
+    deployed_error = deployed - ground_truth
     return {
         "mean_l2": float(np.linalg.norm(error, axis=1).mean()),
         "mse_per_dim": np.mean(error**2, axis=0).tolist(),
         "mae_per_dim": np.mean(np.abs(error), axis=0).tolist(),
-        "horizon_decay_mse": horizon_decay_mse.tolist(),
+        "mean_l2_deployed_full_chunk": float(np.linalg.norm(deployed_error, axis=1).mean()),
     }
 
 
 def _aggregate_metrics(per_episode: dict[int, dict]) -> dict:
-    # nanmean across episodes so short episodes (which leave trailing NaN in horizon_decay_mse) don't poison the aggregate curve.
     if not per_episode:
         return {}
     mean_l2s = np.array([m["mean_l2"] for m in per_episode.values()])
+    deployed_l2s = np.array([m["mean_l2_deployed_full_chunk"] for m in per_episode.values()])
     mse_per_dims = np.stack([np.array(m["mse_per_dim"]) for m in per_episode.values()])
-    horizon_decays = np.stack([np.array(m["horizon_decay_mse"]) for m in per_episode.values()])
     return {
         "mean_l2_mean": float(mean_l2s.mean()),
         "mean_l2_std": float(mean_l2s.std()),
-        "mse_per_dim_mean": np.nanmean(mse_per_dims, axis=0).tolist(),
-        "horizon_decay_mse_mean": np.nanmean(horizon_decays, axis=0).tolist(),
+        "mean_l2_deployed_full_chunk_mean": float(deployed_l2s.mean()),
+        "mse_per_dim_mean": np.mean(mse_per_dims, axis=0).tolist(),
         "n_episodes": len(per_episode),
     }
 
@@ -113,6 +117,119 @@ def _resolve_action_dim_names(dataset: LeRobotDataset, action_dim: int) -> list[
         f"falling back to generic 'Dim N' labels (expected {action_dim} names)."
     )
     return [f"Dim {i + 1}" for i in range(action_dim)]
+
+
+def _build_deployed_stream(predicted_chunks: np.ndarray, ground_truth: np.ndarray, k: int) -> np.ndarray:
+    # Reconstructs what a real-robot deployment at n_action_steps=k would have executed, purely from the
+    # saved chunks: re-query inference at frames 0, k, 2k, ... and pop the pre-computed chunk actions in
+    # between. deployed[t] = chunks[(t // k) * k, t % k]. No extra inference. For k = chunk_size this is
+    # the most-stale cadence (one fresh observation per full chunk).
+    T = ground_truth.shape[0]
+    deployed = np.empty_like(ground_truth)
+    for t in range(T):
+        start = (t // k) * k
+        deployed[t] = predicted_chunks[start, t - start]
+    return deployed
+
+
+def _plot_fresh_stream(
+    ground_truth: np.ndarray,
+    first_action_stream: np.ndarray,
+    action_dim_names: list[str],
+    out_path: Path,
+    ep_idx: int,
+) -> None:
+    # Plot 1 — the fresh-prediction stream: chunk[0] at every frame vs GT. The n_action_steps=1 upper
+    # bound (a brand-new inference per frame, zero deployment staleness).
+    _, n_dims = ground_truth.shape
+    fig, axes = plt.subplots(n_dims, 1, figsize=(12, 2.5 * n_dims), sharex=True, constrained_layout=True)
+    fig.suptitle(f"Plot 1 — Fresh-prediction stream (chunk[0] per frame) vs GT — Episode {ep_idx}")
+    for i in range(n_dims):
+        ax = axes[i] if n_dims > 1 else axes
+        ax.plot(ground_truth[:, i], color="blue", label="Ground Truth")
+        ax.plot(first_action_stream[:, i], color="red", linestyle="--", label="Predicted (chunk[0])")
+        # Arm joint values are in radians (G1 DDS convention); gripper units are policy-specific so leave unlabeled.
+        unit_suffix = "" if "Gripper" in action_dim_names[i] else " (rad)"
+        ax.set_ylabel(f"{action_dim_names[i]}{unit_suffix}")
+        if i == 0:
+            ax.legend(loc="upper right")
+    (axes[-1] if n_dims > 1 else axes).set_xlabel("Timestep")
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+def _plot_chunk_fan(
+    ground_truth: np.ndarray,
+    predicted_chunks: np.ndarray,
+    action_dim_names: list[str],
+    out_path: Path,
+    ep_idx: int,
+    stride: int,
+) -> None:
+    # Plot 2 — the full predicted chunk drawn at each obs step (every `stride` frames), so a chunk that
+    # peels away from GT exposes which observation the policy started drifting from. Each chunk is one
+    # faint polyline spanning [t, t+chunk_size), colored by its start (obs) timestep; GT is the solid
+    # black reference. Chunks are clipped at the episode end so the x-range matches GT.
+    T, chunk_size, n_dims = predicted_chunks.shape
+    norm = Normalize(vmin=0, vmax=max(T - 1, 1))
+    cmap = plt.get_cmap("viridis")
+    fig, axes = plt.subplots(n_dims, 1, figsize=(12, 2.5 * n_dims), sharex=True, constrained_layout=True)
+    fig.suptitle(f"Plot 2 — Full predicted chunks per obs step (stride={stride}) vs GT — Episode {ep_idx}")
+    for i in range(n_dims):
+        ax = axes[i] if n_dims > 1 else axes
+        segments, colors = [], []
+        for t in range(0, T, stride):
+            k_max = min(chunk_size, T - t)
+            if k_max <= 1:
+                continue
+            xs = np.arange(t, t + k_max)
+            segments.append(np.column_stack([xs, predicted_chunks[t, :k_max, i]]))
+            colors.append(cmap(norm(t)))
+        ax.add_collection(LineCollection(segments, colors=colors, linewidths=0.8, alpha=0.5))
+        ax.plot(ground_truth[:, i], color="black", linewidth=1.6, label="Ground Truth", zorder=10)
+        ax.autoscale()
+        ax.set_xlim(0, T)
+        unit_suffix = "" if "Gripper" in action_dim_names[i] else " (rad)"
+        ax.set_ylabel(f"{action_dim_names[i]}{unit_suffix}")
+        if i == 0:
+            ax.legend(loc="upper right")
+    (axes[-1] if n_dims > 1 else axes).set_xlabel("Timestep")
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    sm.set_array([])
+    fig.colorbar(sm, ax=axes, label="chunk start (obs) timestep", fraction=0.015, pad=0.01)
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+def _plot_deployed_full_chunk(
+    ground_truth: np.ndarray,
+    deployed: np.ndarray,
+    action_dim_names: list[str],
+    out_path: Path,
+    ep_idx: int,
+    k: int,
+) -> None:
+    # Plot 3 — the realtime-deployment view at n_action_steps=k (= chunk_size here): re-query inference
+    # only at frames 0, k, 2k, ... (gray verticals) and replay the pre-computed chunk actions in between.
+    # The action drifts on stale observations between re-queries, then snaps at the next query — the
+    # staleness pattern the fresh-stream plot (Plot 1) hides.
+    T, n_dims = ground_truth.shape
+    requery_starts = range(0, T, k)
+    fig, axes = plt.subplots(n_dims, 1, figsize=(12, 2.5 * n_dims), sharex=True, constrained_layout=True)
+    fig.suptitle(f"Plot 3 — Realtime deployment (n_action_steps={k}, full chunk) vs GT — Episode {ep_idx}")
+    for i in range(n_dims):
+        ax = axes[i] if n_dims > 1 else axes
+        ax.plot(ground_truth[:, i], color="blue", label="Ground Truth")
+        ax.plot(deployed[:, i], color="red", linestyle="--", label=f"Deployed (re-query every {k})")
+        for rs in requery_starts:
+            ax.axvline(rs, color="gray", linewidth=0.6, alpha=0.5)
+        unit_suffix = "" if "Gripper" in action_dim_names[i] else " (rad)"
+        ax.set_ylabel(f"{action_dim_names[i]}{unit_suffix}")
+        if i == 0:
+            ax.legend(loc="upper right")
+    (axes[-1] if n_dims > 1 else axes).set_xlabel("Timestep")
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
 
 
 def eval_policy(
@@ -215,70 +332,39 @@ def eval_policy(
         log_inference_times(f"Episode {ep_idx}", inference_times_ms)
         all_inference_times_ms.extend(inference_times_ms)
 
-        # ----- Stack and derive analysis arrays -----
+        # ----- Stack predictions + GT for this episode -----
         ground_truth_actions = np.array(ground_truth_actions)  # (T, action_dim)
         predicted_chunks = np.stack(predicted_chunks)  # (T, chunk_size, action_dim)
         first_action_stream = predicted_chunks[:, 0, :]  # (T, action_dim) — fresh-prediction stream
-
         T_steps, chunk_size, _ = predicted_chunks.shape
 
-        # ----- Horizon-decay MSE per chunk position k -----
-        # For each k: mean over valid t of MSE(chunk[t, k], GT[t+k]). Positions past episode end stay NaN.
-        horizon_decay_mse = np.full(chunk_size, np.nan)
-        for k in range(chunk_size):
-            valid_frames = T_steps - k
-            if valid_frames <= 0:
-                continue
-            diff = predicted_chunks[:valid_frames, k] - ground_truth_actions[k:]
-            horizon_decay_mse[k] = float(np.mean(diff**2))
+        # Plot 3's deployed stream: realtime cadence at n_action_steps = chunk_size (the most-stale case).
+        deployed_full_chunk = _build_deployed_stream(predicted_chunks, ground_truth_actions, chunk_size)
 
-        # ----- Per-episode trajectory plot: GT vs fresh-prediction stream (chunk[0] per frame) -----
-        n_timesteps, n_dims = ground_truth_actions.shape
-
-        fig, axes = plt.subplots(n_dims, 1, figsize=(12, 4 * n_dims), sharex=True)
-        fig.suptitle(f"Ground Truth vs Fresh-Prediction Stream (chunk[0]) — Episode {ep_idx}")
-
-        for i in range(n_dims):
-            ax = axes[i] if n_dims > 1 else axes
-
-            ax.plot(ground_truth_actions[:, i], label="Ground Truth", color="blue")
-            ax.plot(first_action_stream[:, i], label="Predicted (chunk[0])", color="red", linestyle="--")
-            # Arm joint values are in radians (G1 DDS convention); gripper units are policy-specific so leave unlabeled.
-            unit_suffix = "" if "Gripper" in action_dim_names[i] else " (rad)"
-            ax.set_ylabel(f"{action_dim_names[i]}{unit_suffix}")
-            ax.legend()
-
-        axes[-1].set_xlabel("Timestep")
-
-        plt.tight_layout()
-        plt.savefig(episode_dir / "actions_trajectory.png")
-        plt.close(fig)
-
-        # ----- Per-episode horizon-decay plot -----
-        fig, ax = plt.subplots(1, 1, figsize=(10, 5))
-        ax.plot(np.arange(chunk_size), horizon_decay_mse, marker="o", markersize=3, color="purple")
-        ax.set_xlabel("Chunk position k")
-        ax.set_ylabel("Mean squared error")
-        ax.set_title(f"Horizon decay — Episode {ep_idx} (MSE of chunk[k] vs GT[t+k] across t)")
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(episode_dir / "horizon_decay.png")
-        plt.close(fig)
-
-        # ----- Persist raw arrays so any n_action_steps cadence can be derived offline -----
-        np.savez_compressed(
-            episode_dir / "predictions.npz",
-            chunks=predicted_chunks,
-            ground_truth=ground_truth_actions,
-            horizon_decay_mse=horizon_decay_mse,
+        # ----- Three diagnostic plots (chunks stay in memory; nothing persisted to disk) -----
+        # The fan plot gets dense on long episodes; stride keeps it legible while staying per-step on short ones.
+        # cfg.fan_stride overrides the auto rule (fan_stride=1 => draw a chunk from every frame).
+        fan_stride = cfg.fan_stride if cfg.fan_stride is not None else max(1, T_steps // 120)
+        _plot_fresh_stream(
+            ground_truth_actions, first_action_stream, action_dim_names,
+            episode_dir / "1_fresh_chunk0.png", ep_idx,
+        )
+        _plot_chunk_fan(
+            ground_truth_actions, predicted_chunks, action_dim_names,
+            episode_dir / "2_chunk_fan.png", ep_idx, fan_stride,
+        )
+        _plot_deployed_full_chunk(
+            ground_truth_actions, deployed_full_chunk, action_dim_names,
+            episode_dir / "3_deployed_full_chunk.png", ep_idx, chunk_size,
         )
 
         # ----- Per-episode core metrics -----
-        ep_metrics = _compute_episode_metrics(predicted_chunks, ground_truth_actions, horizon_decay_mse)
+        ep_metrics = _compute_episode_metrics(predicted_chunks, ground_truth_actions, deployed_full_chunk)
         per_episode_metrics[ep_idx] = ep_metrics
         mse_arr = np.array(ep_metrics["mse_per_dim"])
         logger_mp.info(
-            f"Episode {ep_idx} metrics: mean_l2={ep_metrics['mean_l2']:.4f} | "
+            f"Episode {ep_idx} metrics: mean_l2={ep_metrics['mean_l2']:.4f} "
+            f"(deployed@{chunk_size}={ep_metrics['mean_l2_deployed_full_chunk']:.4f}) | "
             f"per-dim MSE min={mse_arr.min():.5f} max={mse_arr.max():.5f} mean={mse_arr.mean():.5f}"
         )
 

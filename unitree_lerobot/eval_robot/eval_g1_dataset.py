@@ -12,7 +12,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
-from matplotlib.colors import Normalize
+from matplotlib.colors import LinearSegmentedColormap, Normalize
 from pathlib import Path
 from pprint import pformat
 from typing import Any
@@ -98,13 +98,31 @@ def _aggregate_metrics(per_episode: dict[int, dict]) -> dict:
     mean_l2s = np.array([m["mean_l2"] for m in per_episode.values()])
     deployed_l2s = np.array([m["mean_l2_deployed_full_chunk"] for m in per_episode.values()])
     mse_per_dims = np.stack([np.array(m["mse_per_dim"]) for m in per_episode.values()])
-    return {
+    agg = {
         "mean_l2_mean": float(mean_l2s.mean()),
         "mean_l2_std": float(mean_l2s.std()),
         "mean_l2_deployed_full_chunk_mean": float(deployed_l2s.mean()),
         "mse_per_dim_mean": np.mean(mse_per_dims, axis=0).tolist(),
         "n_episodes": len(per_episode),
     }
+    # Cross-episode boundary-discontinuity aggregate (per arm joint): mean of per-episode means, max of maxes.
+    if all("boundary_discontinuity" in m for m in per_episode.values()):
+        joints = list(next(iter(per_episode.values()))["boundary_discontinuity"]["per_joint"].keys())
+        pj = lambda m, nm: m["boundary_discontinuity"]["per_joint"][nm]  # noqa: E731
+        agg["boundary_discontinuity"] = {
+            "per_joint_mean_deg": {
+                nm: float(np.nanmean([pj(m, nm)["mean_deg"] for m in per_episode.values()])) for nm in joints
+            },
+            "per_joint_max_deg": {
+                nm: float(np.nanmax([pj(m, nm)["max_deg"] for m in per_episode.values()])) for nm in joints
+            },
+        }
+    # Cross-episode horizon-decay curve: nanmean per chunk position across episodes (short episodes leave
+    # trailing NaN at high k, which nanmean ignores).
+    if all("horizon_decay_l2" in m for m in per_episode.values()):
+        hds = np.array([m["horizon_decay_l2"] for m in per_episode.values()], dtype=float)
+        agg["horizon_decay_l2_mean"] = np.nanmean(hds, axis=0).tolist()
+    return agg
 
 
 def _resolve_action_dim_names(dataset: LeRobotDataset, action_dim: int) -> list[str]:
@@ -220,25 +238,33 @@ def _plot_chunk_fan(
     stride: int,
 ) -> None:
     # Plot 2 — the full predicted chunk drawn at each obs step (every `stride` frames), so a chunk that
-    # peels away from GT exposes which observation the policy started drifting from. Each chunk is one
-    # faint polyline spanning [t, t+chunk_size), colored by its start (obs) timestep; GT is the solid
-    # black reference. Chunks are clipped at the episode end so the x-range matches GT.
+    # peels away from GT exposes which observation the policy started drifting from. The color evolves
+    # ALONG each chunk by its within-chunk position k: blue at k=0 (the immediate prediction) -> red at
+    # k=chunk_size-1 (the far-horizon extrapolation), so on each fan you can see which part is early vs
+    # late. GT is the solid black reference. Chunks are clipped at the episode end so x matches GT.
     T, chunk_size, n_dims = predicted_chunks.shape
-    norm = Normalize(vmin=0, vmax=max(T - 1, 1))
-    cmap = plt.get_cmap("viridis")
+    norm = Normalize(vmin=0, vmax=max(chunk_size - 1, 1))
+    cmap = LinearSegmentedColormap.from_list("chunk_pos", ["blue", "red"])
     fig, axes = plt.subplots(n_dims, 1, figsize=(12, 2.5 * n_dims), sharex=True, constrained_layout=True)
-    fig.suptitle(f"Plot 2 — Full predicted chunks per obs step (stride={stride}) vs GT — Episode {ep_idx}")
+    fig.suptitle(
+        f"Plot 2 — Full predicted chunks per obs step (stride={stride}), colored early(blue)→late(red) "
+        f"within each chunk — Episode {ep_idx}"
+    )
     for i in range(n_dims):
         ax = axes[i] if n_dims > 1 else axes
-        segments, colors = [], []
+        # Break each drawn chunk into per-step segments so the color can vary along it (scalar = position k).
+        seg_list, pos_list = [], []
         for t in range(0, T, stride):
             k_max = min(chunk_size, T - t)
             if k_max <= 1:
                 continue
-            xs = np.arange(t, t + k_max)
-            segments.append(np.column_stack([xs, predicted_chunks[t, :k_max, i]]))
-            colors.append(cmap(norm(t)))
-        ax.add_collection(LineCollection(segments, colors=colors, linewidths=0.8, alpha=0.5))
+            pts = np.column_stack([np.arange(t, t + k_max), predicted_chunks[t, :k_max, i]])  # (k_max, 2)
+            seg_list.append(np.stack([pts[:-1], pts[1:]], axis=1))  # (k_max-1, 2, 2)
+            pos_list.append(np.arange(k_max - 1))  # color each segment by its start position k
+        if seg_list:
+            lc = LineCollection(np.concatenate(seg_list), cmap=cmap, norm=norm, linewidths=0.8, alpha=0.5)
+            lc.set_array(np.concatenate(pos_list))
+            ax.add_collection(lc)
         ax.plot(ground_truth[:, i], color="black", linewidth=1.6, label="Ground Truth", zorder=10)
         ax.autoscale()
         ax.set_xlim(0, T)
@@ -249,7 +275,7 @@ def _plot_chunk_fan(
     (axes[-1] if n_dims > 1 else axes).set_xlabel("Timestep")
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
-    fig.colorbar(sm, ax=axes, label="chunk start (obs) timestep", fraction=0.015, pad=0.01)
+    fig.colorbar(sm, ax=axes, label="within-chunk position k (early=blue → late=red)", fraction=0.015, pad=0.01)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
@@ -281,6 +307,98 @@ def _plot_deployed_full_chunk(
         if i == 0:
             ax.legend(loc="upper right")
     (axes[-1] if n_dims > 1 else axes).set_xlabel("Timestep")
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+def _boundary_jump_stats(deployed: np.ndarray, action_dim_names: list[str], k: int) -> dict:
+    # Per-arm-joint chunk-boundary discontinuity on the deployed stream. At each re-query boundary
+    # b = k, 2k, ... the action jumps from the stale last action of the old chunk (deployed[b-1]) to the
+    # fresh first action of the new chunk (deployed[b]); |deployed[b,j] - deployed[b-1,j]| is that jump.
+    # Arm joints only (grippers excluded — different units), converted to degrees (arm actions are radians).
+    # Returns per-joint mean/max (json-safe lists) plus the raw per-boundary jumps for plotting.
+    T, _ = deployed.shape
+    boundaries = np.arange(k, T, k)  # index of the first deployed sample of each new chunk
+    arm_idx = [i for i, n in enumerate(action_dim_names) if "Gripper" not in n]
+    arm_names = [action_dim_names[i] for i in arm_idx]
+    if boundaries.size == 0:
+        nan = [float("nan")] * len(arm_idx)
+        return {"arm_names": arm_names, "mean_deg": nan, "max_deg": nan,
+                "n_boundaries": 0, "boundaries": boundaries, "jumps_deg": np.empty((0, len(arm_idx)))}
+    jumps_deg = np.degrees(np.abs(deployed[boundaries] - deployed[boundaries - 1]))[:, arm_idx]  # (n_b, n_arm)
+    return {
+        "arm_names": arm_names,
+        "mean_deg": jumps_deg.mean(axis=0).tolist(),
+        "max_deg": jumps_deg.max(axis=0).tolist(),
+        "n_boundaries": int(boundaries.size),
+        "boundaries": boundaries,
+        "jumps_deg": jumps_deg,
+    }
+
+
+def _plot_boundary_discontinuity(disc: dict, out_path: Path, ep_idx: int, k: int) -> None:
+    # Plot 4 — one bar chart per ARM joint (grippers excluded). Each bar is one chunk-boundary
+    # discontinuity event: x = boundary timestep, height = |Δaction| at that boundary (degrees). The
+    # dashed line marks the per-joint mean; mean/max are in each subplot title. Shows the magnitude of
+    # every discontinuity across the episode, per joint.
+    arm_names, boundaries, jumps_deg = disc["arm_names"], disc["boundaries"], disc["jumps_deg"]
+    n = len(arm_names)
+    if disc["n_boundaries"] == 0 or n == 0:
+        logger_mp.warning(
+            "No chunk boundaries (episode shorter than one chunk) or no arm joints; skipping plot 4."
+        )
+        return
+    # sharey=True puts all joints on one scale so bar heights are visually comparable across joints
+    # (the per-joint titles still carry absolute mean/max in case a quiet joint's bars look flat).
+    fig, axes = plt.subplots(n, 1, figsize=(12, 1.8 * n), sharex=True, sharey=True, constrained_layout=True)
+    fig.suptitle(f"Plot 4 — chunk-boundary discontinuity per arm joint (n_action_steps={k}) — Episode {ep_idx}")
+    bar_w = max(1.0, k * 0.6)
+    for row in range(n):
+        ax = axes[row] if n > 1 else axes
+        vals = jumps_deg[:, row]
+        mean_v, max_v = float(vals.mean()), float(vals.max())
+        ax.bar(boundaries, vals, width=bar_w, color="indianred", align="center")
+        ax.axhline(mean_v, color="black", linestyle="--", linewidth=0.8)
+        ax.set_ylabel("|Δ| (deg)")
+        ax.set_title(f"{arm_names[row]}    mean={mean_v:.2f}°   max={max_v:.2f}°", fontsize=9, loc="left")
+    (axes[-1] if n > 1 else axes).set_xlabel("chunk-boundary timestep")
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+
+
+def _horizon_decay_l2(predicted_chunks: np.ndarray, ground_truth: np.ndarray) -> np.ndarray:
+    # For each chunk position k: mean over valid frames t of ‖chunk[t,k] − GT[t+k]‖₂ — how well the policy
+    # predicts k steps ahead from a single observation, averaged over the episode. Phase-free and
+    # position-resolved (the "global view" of chunk predictive quality). hd[0] == fresh mean_l2 by
+    # construction; same per-frame L2 convention as mean_l2/deployed, so E[deployed@k] ≈ mean(hd[0:k]).
+    # Positions past the episode end (T − k ≤ 0) stay NaN.
+    T, chunk_size, _ = predicted_chunks.shape
+    hd = np.full(chunk_size, np.nan)
+    for k in range(chunk_size):
+        if T - k <= 0:
+            continue
+        diff = predicted_chunks[: T - k, k] - ground_truth[k:]
+        hd[k] = float(np.linalg.norm(diff, axis=1).mean())
+    return hd
+
+
+def _plot_horizon_decay(hd: np.ndarray, out_path: Path, ep_idx: int) -> None:
+    # Plot 5 — horizon decay: per-position prediction error vs chunk position k (how far ahead a single
+    # observation can predict). The dashed running mean of hd[0..k] tracks the expected deployment error
+    # if you re-query every k+1 frames; its endpoint ≈ deployed@chunk_size, and the curve's steepness is
+    # the principled basis for choosing the deployment cadence (re-query before it climbs too far).
+    chunk_size = hd.shape[0]
+    ks = np.arange(chunk_size)
+    running_mean = np.array([np.nanmean(hd[: k + 1]) for k in range(chunk_size)])
+    fig, ax = plt.subplots(figsize=(10, 5), constrained_layout=True)
+    ax.plot(ks, hd, marker="o", markersize=3, color="purple", label="horizon decay  hd[k] = ‖chunk[k] − GT[t+k]‖")
+    ax.plot(ks, running_mean, color="green", linestyle="--", linewidth=1.2,
+            label="running mean of hd[0..k]  (≈ deployed error using positions 0..k)")
+    ax.set_xlabel("chunk position k (steps ahead of the observation)")
+    ax.set_ylabel("mean L2 error")
+    ax.set_title(f"Plot 5 — horizon decay (chunk[k] vs GT[t+k] across t) — Episode {ep_idx}")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", fontsize=8)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)
 
@@ -411,9 +529,26 @@ def eval_policy(
             ground_truth_actions, deployed_full_chunk, action_dim_names,
             episode_dir / "3_deployed_full_chunk.png", ep_idx, chunk_size,
         )
+        # Plot 4 + per-joint boundary-discontinuity stats (same deployed stream / cadence as plot 3).
+        disc = _boundary_jump_stats(deployed_full_chunk, action_dim_names, chunk_size)
+        _plot_boundary_discontinuity(
+            disc, episode_dir / "4_boundary_discontinuity.png", ep_idx, chunk_size,
+        )
+        # Plot 5 — horizon decay: per-position predictive error (the global, phase-free view of how well
+        # one observation predicts the future; hd[0] == fresh mean_l2, mean(hd[0:k]) ≈ deployed@k).
+        horizon_decay = _horizon_decay_l2(predicted_chunks, ground_truth_actions)
+        _plot_horizon_decay(horizon_decay, episode_dir / "5_horizon_decay.png", ep_idx)
 
         # ----- Per-episode core metrics -----
         ep_metrics = _compute_episode_metrics(predicted_chunks, ground_truth_actions, deployed_full_chunk)
+        ep_metrics["boundary_discontinuity"] = {
+            "n_boundaries": disc["n_boundaries"],
+            "per_joint": {
+                nm: {"mean_deg": mn, "max_deg": mx}
+                for nm, mn, mx in zip(disc["arm_names"], disc["mean_deg"], disc["max_deg"])
+            },
+        }
+        ep_metrics["horizon_decay_l2"] = horizon_decay.tolist()
         per_episode_metrics[ep_idx] = ep_metrics
         mse_arr = np.array(ep_metrics["mse_per_dim"])
         logger_mp.info(
@@ -421,6 +556,13 @@ def eval_policy(
             f"(deployed@{chunk_size}={ep_metrics['mean_l2_deployed_full_chunk']:.4f}) | "
             f"per-dim MSE min={mse_arr.min():.5f} max={mse_arr.max():.5f} mean={mse_arr.mean():.5f}"
         )
+        if disc["n_boundaries"]:
+            wj = int(np.argmax(disc["max_deg"]))
+            logger_mp.info(
+                f"Episode {ep_idx} boundary discontinuity (n={disc['n_boundaries']}): "
+                f"worst joint {disc['arm_names'][wj]} max={disc['max_deg'][wj]:.2f}° "
+                f"mean={disc['mean_deg'][wj]:.2f}°"
+            )
 
     # ===== Cross-episode aggregate latency summary =====
     log_inference_times("All episodes", all_inference_times_ms)
